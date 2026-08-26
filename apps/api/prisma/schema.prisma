@@ -1,0 +1,171 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum IncidentStatus {
+  RECEIVED
+  ANALYZING
+  POLICY_PENDING
+  AUTO_RETRY
+  APPROVAL_REQUIRED
+  STOPPED
+  NO_ACTION
+  EXECUTING
+  PROCESSING
+  RECOVERED
+  FAILED
+  REVERSED
+  ESCALATE
+  EXECUTION_UNKNOWN
+}
+
+enum Decision {
+  AUTO_RETRY
+  APPROVAL_REQUIRED
+  ESCALATE
+  STOPPED
+  NO_ACTION
+}
+
+enum ReviewStatus {
+  OPEN
+  APPROVED
+  REJECTED
+}
+
+enum ExecutionOutcome {
+  PENDING
+  SUCCEEDED
+  FAILED
+  UNKNOWN
+}
+
+model PayoutIncident {
+  id                 String            @id @default(uuid())
+  razorpayPayoutId   String            @unique
+  status             IncidentStatus
+  amountPaise        Int
+  currency           String            @default("INR")
+  currentReason      String?
+  beneficiaryRef     String?
+  attempts           Int               @default(0)
+  duplicateSuspected Boolean           @default(false)
+  createdAt          DateTime          @default(now())
+  updatedAt          DateTime          @updatedAt
+  events             PayoutEvent[]
+  analyses           AiAnalysis[]
+  policyDecisions    PolicyDecision[]
+  executions         ActionExecution[]
+  reviewTasks        ReviewTask[]
+  auditEvents        AuditEvent[]
+  batchResults       BatchResult[]
+}
+
+model PayoutEvent {
+  id               String          @id @default(uuid())
+  externalEventId  String          @unique
+  eventType        String
+  payloadJson      Json
+  receivedAt       DateTime        @default(now())
+  payoutIncidentId String?
+  payoutIncident   PayoutIncident? @relation(fields: [payoutIncidentId], references: [id])
+}
+
+model AiAnalysis {
+  id            String         @id @default(uuid())
+  incidentId    String
+  incident      PayoutIncident @relation(fields: [incidentId], references: [id])
+  modelRef      String
+  promptVersion String
+  outputJson    Json
+  confidence    Float
+  createdAt     DateTime       @default(now())
+}
+
+model PolicyDecision {
+  id             String         @id @default(uuid())
+  incidentId     String
+  incident       PayoutIncident @relation(fields: [incidentId], references: [id])
+  policyVersion  String
+  proposedAction String
+  finalDecision  Decision
+  reasonsJson    Json
+  createdAt      DateTime       @default(now())
+}
+
+model ActionExecution {
+  id             String           @id @default(uuid())
+  incidentId     String
+  incident       PayoutIncident   @relation(fields: [incidentId], references: [id])
+  actionType     String
+  idempotencyKey String           @unique
+  requestHash    String
+  responseJson   Json?
+  outcome        ExecutionOutcome @default(PENDING)
+  scheduledFor   DateTime         @default(now())
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
+}
+
+model ReviewTask {
+  id         String         @id @default(uuid())
+  incidentId String
+  incident   PayoutIncident @relation(fields: [incidentId], references: [id])
+  severity   String
+  status     ReviewStatus   @default(OPEN)
+  decision   String?
+  decidedAt  DateTime?
+  actorId    String?
+  createdAt  DateTime       @default(now())
+}
+
+model AuditEvent {
+  id            String         @id @default(uuid())
+  incidentId    String
+  incident      PayoutIncident @relation(fields: [incidentId], references: [id])
+  eventType     String
+  actorType     String
+  actorId       String?
+  policyVersion String?
+  decision      String?
+  amountPaise   Int?
+  rationale     String
+  dataJson      Json
+  createdAt     DateTime       @default(now())
+}
+
+model PolicyConfig {
+  id          String   @id @default(uuid())
+  version     String   @unique
+  rulesJson   Json
+  active      Boolean  @default(true)
+  effectiveAt DateTime @default(now())
+  createdBy   String
+}
+
+model BatchRun {
+  id                    String        @id @default(uuid())
+  name                  String
+  cohortSize            Int
+  totalValueAtRiskPaise Int           @default(0)
+  startedAt             DateTime      @default(now())
+  completedAt           DateTime?
+  results               BatchResult[]
+}
+
+model BatchResult {
+  id                  String         @id @default(uuid())
+  batchRunId          String
+  batchRun            BatchRun       @relation(fields: [batchRunId], references: [id])
+  incidentId          String
+  incident            PayoutIncident @relation(fields: [incidentId], references: [id])
+  finalState          String
+  recoveredValuePaise Int            @default(0)
+
+  @@unique([batchRunId, incidentId])
+}

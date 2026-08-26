@@ -1,0 +1,22 @@
+{
+  "name": "recoveryos",
+  "private": true,
+  "packageManager": "pnpm@11.19.0",
+  "scripts": {
+    "dev": "pnpm --parallel --stream dev",
+    "build": "pnpm -r build",
+    "test": "pnpm --filter @recoveryos/domain test && pnpm --filter @recoveryos/api test",
+    "db:generate": "pnpm --filter @recoveryos/api prisma:generate",
+    "db:validate": "pnpm --filter @recoveryos/api prisma:validate",
+    "db:push": "pnpm --filter @recoveryos/api prisma:push",
+    "db:migrate:deploy": "pnpm --filter @recoveryos/api prisma:migrate:deploy",
+    "simulate": "pnpm --filter @recoveryos/api simulate",
+    "acceptance:webhook": "pnpm --filter @recoveryos/api acceptance:webhook",
+    "razorpay:readiness": "pnpm --filter @recoveryos/api razorpay:readiness",
+    "razorpay:sandbox-exercise": "pnpm --filter @recoveryos/api razorpay:sandbox-exercise",
+    "ai:evaluate": "pnpm --filter @recoveryos/api ai:evaluate"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.3"
+  }
+}

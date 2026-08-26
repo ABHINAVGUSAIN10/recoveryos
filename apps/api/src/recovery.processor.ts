@@ -1,0 +1,40 @@
+import { Processor, WorkerHost } from '@nestjs/bullmq';
+import { Job } from 'bullmq';
+import { ExecutionOutcome, IncidentStatus } from '@prisma/client';
+import { PrismaService } from './prisma.service';
+import { RazorpayExecutionUncertainError, RazorpayService } from './razorpay.service';
+import { RecoveryService } from './recovery.service';
+import { safeErrorMessage } from './redaction';
+
+@Processor('recovery')
+export class RecoveryProcessor extends WorkerHost {
+  constructor(private readonly prisma: PrismaService, private readonly razorpay: RazorpayService, private readonly recovery: RecoveryService) { super(); }
+  async process(job: Job<{ executionId: string }>) {
+    if (job.name !== 'execute-retry') return;
+    const execution = await this.prisma.actionExecution.findUniqueOrThrow({ where: { id: job.data.executionId }, include: { incident: true } });
+    if (execution.outcome !== ExecutionOutcome.PENDING) return;
+    if (execution.incident.status === IncidentStatus.EXECUTING) {
+      await this.recovery.recordExecutionResult(execution.id, ExecutionOutcome.UNKNOWN, { error: 'Worker resumed an in-progress execution; provider reconciliation is required.' });
+      return;
+    }
+    if (execution.incident.status !== IncidentStatus.AUTO_RETRY) return;
+    const claimed = await this.prisma.payoutIncident.updateMany({ where: { id: execution.incidentId, status: IncidentStatus.AUTO_RETRY }, data: { status: IncidentStatus.EXECUTING } });
+    if (!claimed.count) return;
+    try {
+      const response = await this.razorpay.executeRecovery(execution.idempotencyKey, execution.incident.razorpayPayoutId, execution.incidentId);
+      const providerStatus = String(response?.status ?? '').toLowerCase();
+      const outcome = providerStatus === 'processed'
+        ? ExecutionOutcome.SUCCEEDED
+        : ['failed', 'rejected', 'cancelled', 'reversed'].includes(providerStatus)
+          ? ExecutionOutcome.FAILED
+          : ExecutionOutcome.UNKNOWN;
+      await this.recovery.recordExecutionResult(execution.id, outcome, response);
+    } catch (error) {
+      const message = safeErrorMessage(error, 'Unknown execution failure');
+      const unknown = error instanceof RazorpayExecutionUncertainError || /timeout|network|unknown|reconciliation/i.test(message);
+      await this.recovery.recordExecutionResult(execution.id, unknown ? ExecutionOutcome.UNKNOWN : ExecutionOutcome.FAILED, { error: message });
+      if (unknown) return;
+      throw error;
+    }
+  }
+}

@@ -1,0 +1,14 @@
+node_modules
+.pnpm-store
+.next
+dist
+coverage
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+!.env.production.example
+*.log
+prisma/dev.db
+/apps/*/pnpm-lock.yaml
+/packages/*/pnpm-lock.yaml

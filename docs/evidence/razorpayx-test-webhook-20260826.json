@@ -1,0 +1,48 @@
+{
+  "recordedAt": "2026-08-26T06:52:34.5583592Z",
+  "environment": "razorpayx-test-mode",
+  "deployment": "redacted",
+  "simulationMode": true,
+  "providerPreflight": {
+    "authenticated": true,
+    "httpStatus": 200,
+    "sufficientDummyBalance": true,
+    "contactCount": 1,
+    "fundAccountCount": 1,
+    "activeCompatibleFundAccount": true
+  },
+  "payout": {
+    "id": "pout_...ORiyr",
+    "referenceId": "recoveryos-funded-webhook-v1",
+    "amountPaise": 100,
+    "initialProviderStatus": "processing",
+    "terminalProviderStatus": "processed",
+    "idempotentReplayPayoutId": "pout_...ORiyr",
+    "idempotentReplayCreatedDuplicate": false
+  },
+  "webhook": {
+    "providerEventTypes": [
+      "payout.initiated",
+      "payout.processed"
+    ],
+    "signatureAccepted": true,
+    "incidentId": "redacted",
+    "persistedEventCount": 2,
+    "webhookAuditCount": 2
+  },
+  "safetyOutcome": {
+    "incidentStatus": "RECOVERED",
+    "policyDecision": "STOPPED",
+    "recoveryAttempts": 0,
+    "actionExecutions": 0,
+    "queueWaiting": 0,
+    "queueActive": 0,
+    "queueDelayed": 0,
+    "queueFailed": 0
+  },
+  "verification": {
+    "testsPassed": 66,
+    "testSuitesPassed": 15,
+    "productionBuildPassed": true
+  }
+}

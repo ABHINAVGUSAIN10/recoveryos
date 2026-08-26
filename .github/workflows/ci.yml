@@ -1,0 +1,33 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm db:generate
+      - run: pnpm test
+      - run: pnpm build
+
+  deployment-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate production Compose configuration
+        run: |
+          cp .env.production.example .env.production
+          docker compose -f docker-compose.production.yml config --quiet
+      - name: Validate Caddy configuration
+        run: docker run --rm -e RECOVERYOS_DOMAIN=recovery.example.com -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2-alpine caddy validate --config /etc/caddy/Caddyfile
+      - name: Build API image
+        run: docker build -f apps/api/Dockerfile -t recoveryos-api:ci .
+      - name: Build web image
+        run: docker build --build-arg NEXT_PUBLIC_API_URL=/api/v1 -f apps/web/Dockerfile -t recoveryos-web:ci .

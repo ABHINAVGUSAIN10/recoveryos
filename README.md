@@ -31,6 +31,7 @@ Upstash supports BullMQ over its Redis protocol. BullMQ polls Redis while idle, 
 - **Policy controls** activates a versioned retry limit, autonomous amount cap, and minimum delay. Use a new version identifier for each material change.
 - **Operations** reports credential-free Neon and Redis readiness, BullMQ job counts, simulation safety, and the configured advisory provider/model/prompt version.
 - **Live demo** creates one or four uniquely identified synthetic incidents through the real AI, policy, durable-action, BullMQ, batch, and audit pipeline. It is disabled by default and can run only while simulation mode is enabled.
+- **RazorpayX Test Mode demo** is a separately guarded presenter action. It seeds a controlled temporary-failure incident, runs the same hosted-AI and deterministic-policy path, and—only when policy authorizes—creates one fixed ₹10,000 payout against a dedicated dummy Test Mode fund account.
 
 Batch reporting separates gross recovery from policy-eligible recovery. The SRD recovery target is evaluated using `recovered eligible value / eligible value`; already-processed payouts are included in gross recovery but excluded from that eligible denominator. Pending recovery, protected, and manual-review values are also reported in integer paise.
 
@@ -42,6 +43,8 @@ Incident listing supports bounded server-side pagination and filtering: `page`, 
 Structured request logs include a generated or caller-supplied `x-request-id`, method, path, response status, duration, actor role, and simulation state. Query strings, request bodies, authorization headers, and credentials are excluded. Set `LOG_REQUESTS=false` only when local noise needs to be reduced.
 
 To enable the presenter console, set `ENABLE_LIVE_DEMO=true` and keep `SIMULATION_MODE=true`. `DEMO_RETRY_DELAY_SECONDS=5` transparently compresses only a synthetic autonomous retry's execution delay; the original policy delay and the effective demonstration delay are both recorded in the audit event. The API rejects demo controls when financial execution is enabled. An operator or administrator token is required in token-auth mode.
+
+The real-provider presenter action has its own fail-closed switch. Keep `SIMULATION_MODE=true`, set `AUTH_MODE=token`, configure only a `rzp_test_` key pair, set `RAZORPAYX_TEST_DEMO_FUND_ACCOUNT_ID` to the dedicated dummy destination, and then set `ENABLE_RAZORPAYX_TEST_DEMO=true`. The server fixes the amount at 1,000,000 paise, requires administrator authorization and an explicit confirmation, uses a durable idempotency key, and applies `RAZORPAYX_TEST_DEMO_COOLDOWN_SECONDS` (default 300). It refuses live keys, an inactive/unconfigured fund account, insufficient dummy balance, a policy cap below ₹10,000, or global financial execution.
 
 ## Authentication modes
 

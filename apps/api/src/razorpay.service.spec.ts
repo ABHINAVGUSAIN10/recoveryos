@@ -16,6 +16,8 @@ describe('RazorpayService guarded payout adapter', () => {
     process.env.SIMULATION_MODE = 'false';
     process.env.RAZORPAY_KEY_ID = 'test-id';
     process.env.RAZORPAY_KEY_SECRET = 'test-secret';
+    process.env.ENABLE_RAZORPAYX_TEST_DEMO = 'false';
+    delete process.env.RAZORPAYX_TEST_DEMO_FUND_ACCOUNT_ID;
     delete process.env.RAZORPAY_TIMEOUT_MS;
     global.fetch = savedFetch;
   });
@@ -101,5 +103,53 @@ describe('RazorpayService guarded payout adapter', () => {
     expect(key.length).toBeLessThanOrEqual(36);
     expect(reference.length).toBeLessThanOrEqual(40);
     expect(incidentIdFromRecoveryReference(reference)).toBe(incidentId);
+  });
+
+  it('creates only the fixed ₹10,000 payout through the separately guarded Test Mode path', async () => {
+    process.env.SIMULATION_MODE = 'true';
+    process.env.ENABLE_RAZORPAYX_TEST_DEMO = 'true';
+    process.env.RAZORPAY_KEY_ID = 'rzp_test_safe';
+    process.env.RAZORPAYX_TEST_DEMO_FUND_ACCOUNT_ID = 'fa_demo';
+    global.fetch = jest.fn()
+      .mockResolvedValueOnce({ ok: true, json: jest.fn().mockResolvedValue({ items: [{ account_number: '1234567890', available_amount: 10_000_000 }] }) })
+      .mockResolvedValueOnce({ ok: true, json: jest.fn().mockResolvedValue({ items: [{ id: 'fa_demo', active: true, account_type: 'bank_account' }] }) })
+      .mockResolvedValueOnce({ ok: true, json: jest.fn().mockResolvedValue({ id: 'pout_demo', status: 'processing' }) }) as never;
+
+    await expect(new RazorpayService().executeTestDemoPayout('rr_demo_key', incidentId))
+      .resolves.toEqual({ id: 'pout_demo', status: 'processing' });
+
+    expect(global.fetch).toHaveBeenCalledTimes(3);
+    const [, createRequest] = (global.fetch as jest.Mock).mock.calls[2];
+    expect(createRequest.headers['X-Payout-Idempotency']).toBe('rr_demo_key');
+    expect(JSON.parse(createRequest.body)).toMatchObject({
+      fund_account_id: 'fa_demo',
+      amount: 1_000_000,
+      currency: 'INR',
+      mode: 'IMPS',
+      reference_id: recoveryReferenceId(incidentId),
+    });
+  });
+
+  it('cannot use the provider demo path with live keys or while global execution is enabled', async () => {
+    process.env.ENABLE_RAZORPAYX_TEST_DEMO = 'true';
+    process.env.RAZORPAYX_TEST_DEMO_FUND_ACCOUNT_ID = 'fa_demo';
+    process.env.RAZORPAY_KEY_ID = 'rzp_live_unsafe';
+    global.fetch = jest.fn();
+    await expect(new RazorpayService().executeTestDemoPayout('rr_demo_key', incidentId)).rejects.toBeInstanceOf(RazorpayRecoveryBlockedError);
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it('reconciles a provider demo payout against RazorpayX even while global simulation remains enabled', async () => {
+    process.env.SIMULATION_MODE = 'true';
+    process.env.ENABLE_RAZORPAYX_TEST_DEMO = 'true';
+    process.env.RAZORPAY_KEY_ID = 'rzp_test_safe';
+    process.env.RAZORPAYX_TEST_DEMO_FUND_ACCOUNT_ID = 'fa_demo';
+    global.fetch = jest.fn().mockResolvedValue({ ok: true, json: jest.fn().mockResolvedValue({ id: 'pout_demo', status: 'processed' }) }) as never;
+
+    await expect(new RazorpayService().fetchTestDemoPayout('pout_demo')).resolves.toEqual({ id: 'pout_demo', status: 'processed' });
+    expect(global.fetch).toHaveBeenCalledWith(
+      'https://api.razorpay.com/v1/payouts/pout_demo',
+      expect.objectContaining({ method: 'GET' }),
+    );
   });
 });

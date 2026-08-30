@@ -205,6 +205,25 @@ describe('RecoveryService live demonstration', () => {
     } } } });
     expect(ingest.mock.calls[0][3]).toMatchObject({ actorId: 'token:operator', retryDelaySeconds: 5 });
   });
+
+  it('creates a fixed ₹10,000 provider-test run only after explicit confirmation', async () => {
+    const razorpay = { testDemoConfiguration: jest.fn().mockReturnValue({ enabled: true, ready: true, amountPaise: 1_000_000 }) };
+    const prisma = { actionExecution: { findFirst: jest.fn().mockResolvedValue(null) } };
+    const service = new RecoveryService(prisma as never, { status: jest.fn().mockReturnValue({ configured: true }) } as never, razorpay as never, {} as never);
+    jest.spyOn(service, 'getPolicy').mockResolvedValue({ version: 'v1', maxAutoRetryAttempts: 2, maxAutonomousAmountPaise: 1_000_000, minimumRetryDelayMinutes: 30 });
+    const ingest = jest.spyOn(service, 'ingestWebhook')
+      .mockResolvedValueOnce({ duplicate: false, incidentId: 'incident-rx' })
+      .mockResolvedValueOnce({ duplicate: true, incidentId: 'incident-rx' });
+    jest.spyOn(service, 'createBatch').mockResolvedValue({ id: 'batch-rx', name: 'RazorpayX Test Demo' } as never);
+    jest.spyOn(service, 'incidentDetail').mockResolvedValue({ id: 'incident-rx', amountPaise: 1_000_000, status: IncidentStatus.AUTO_RETRY } as never);
+
+    await expect(service.runRazorpayTestDemo('wrong', 'token:admin')).rejects.toThrow('confirmation');
+    const result = await service.runRazorpayTestDemo('CREATE INR 10000 TEST PAYOUT', 'token:admin');
+
+    expect(result).toMatchObject({ amountPaise: 1_000_000, duplicateReplayVerified: true, incident: { id: 'incident-rx' } });
+    expect(ingest.mock.calls[0][2]).toMatchObject({ payload: { payout: { entity: { amount: 1_000_000, status: 'failed' } } } });
+    expect(ingest.mock.calls[0][3]).toMatchObject({ actorId: 'token:admin', executionMode: 'RAZORPAYX_TEST' });
+  });
 });
 
 describe('RecoveryService batch reporting', () => {
@@ -243,7 +262,8 @@ describe('RecoveryService operational status', () => {
       getJobCounts: jest.fn().mockResolvedValue({ waiting: 2, active: 1, delayed: 3, completed: 4, failed: 0, paused: 0 }),
     };
     const ai = { status: jest.fn().mockReturnValue({ mode: 'deterministic-simulator', configured: false, provider: 'deterministic', model: 'heuristic-v1', promptVersion: 'heuristic-v1' }) };
-    const service = new RecoveryService(prisma as never, ai as never, {} as never, queue as never);
+    const razorpay = { testDemoConfiguration: jest.fn().mockReturnValue({ enabled: false, ready: false, testMode: false, simulationSafe: true, fundAccountConfigured: false, amountPaise: 1_000_000, confirmation: 'CREATE INR 10000 TEST PAYOUT' }) };
+    const service = new RecoveryService(prisma as never, ai as never, razorpay as never, queue as never);
 
     const result = await service.operations();
 
@@ -259,7 +279,8 @@ describe('RecoveryService operational status', () => {
     const prisma = { $queryRaw: jest.fn().mockRejectedValue(new Error('database unavailable')) };
     const queue = { getJobCounts: jest.fn().mockRejectedValue(new Error('redis unavailable')) };
     const ai = { status: jest.fn().mockReturnValue({ mode: 'deterministic-simulator', configured: false }) };
-    const service = new RecoveryService(prisma as never, ai as never, {} as never, queue as never);
+    const razorpay = { testDemoConfiguration: jest.fn().mockReturnValue({ enabled: false, ready: false, testMode: false, simulationSafe: true, fundAccountConfigured: false, amountPaise: 1_000_000, confirmation: 'CREATE INR 10000 TEST PAYOUT' }) };
+    const service = new RecoveryService(prisma as never, ai as never, razorpay as never, queue as never);
 
     await expect(service.operations()).resolves.toMatchObject({ status: 'degraded', services: { database: false, redis: false } });
   });

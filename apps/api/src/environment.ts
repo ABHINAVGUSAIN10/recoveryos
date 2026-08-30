@@ -8,6 +8,9 @@ const environmentSchema = z.object({
   LOG_REQUESTS: z.enum(['true', 'false']).default('true'),
   SIMULATION_MODE: z.enum(['true', 'false']).default('true'),
   ENABLE_LIVE_DEMO: z.enum(['true', 'false']).default('false'),
+  ENABLE_RAZORPAYX_TEST_DEMO: z.enum(['true', 'false']).default('false'),
+  RAZORPAYX_TEST_DEMO_FUND_ACCOUNT_ID: z.string().optional(),
+  RAZORPAYX_TEST_DEMO_COOLDOWN_SECONDS: z.string().regex(/^\d+$/, 'must be seconds').default('300'),
   DEMO_RETRY_DELAY_SECONDS: z.string().regex(/^\d+$/, 'must be seconds').default('5'),
   AUTH_MODE: z.enum(['disabled', 'token']).default('disabled'),
   ALLOWED_ORIGINS: z.string().default('http://localhost:3000'),
@@ -34,6 +37,7 @@ export function validateEnvironment(values: Record<string, unknown>) {
   const tokenAuth = env.AUTH_MODE === 'token';
   const liveExecution = env.SIMULATION_MODE === 'false';
   const liveDemo = env.ENABLE_LIVE_DEMO === 'true';
+  const razorpayTestDemo = env.ENABLE_RAZORPAYX_TEST_DEMO === 'true';
 
   if (production && !tokenAuth) errors.push('AUTH_MODE must be token when NODE_ENV is production');
   if (production && (!env.ALLOWED_ORIGINS || env.ALLOWED_ORIGINS.includes('*'))) errors.push('ALLOWED_ORIGINS must explicitly list trusted origins in production');
@@ -52,8 +56,16 @@ export function validateEnvironment(values: Record<string, unknown>) {
   }
 
   const demoDelaySeconds = Number.parseInt(env.DEMO_RETRY_DELAY_SECONDS, 10);
+  const testDemoCooldownSeconds = Number.parseInt(env.RAZORPAYX_TEST_DEMO_COOLDOWN_SECONDS, 10);
   if (liveDemo && liveExecution) errors.push('ENABLE_LIVE_DEMO requires SIMULATION_MODE=true');
+  if (razorpayTestDemo) {
+    if (liveExecution) errors.push('ENABLE_RAZORPAYX_TEST_DEMO requires SIMULATION_MODE=true');
+    if (!tokenAuth) errors.push('ENABLE_RAZORPAYX_TEST_DEMO requires AUTH_MODE=token');
+    if (!env.RAZORPAY_KEY_ID?.startsWith('rzp_test_') || !env.RAZORPAY_KEY_SECRET) errors.push('ENABLE_RAZORPAYX_TEST_DEMO requires a Razorpay Test Mode key pair');
+    if (!env.RAZORPAYX_TEST_DEMO_FUND_ACCOUNT_ID?.startsWith('fa_')) errors.push('RAZORPAYX_TEST_DEMO_FUND_ACCOUNT_ID must identify the dedicated Test Mode fund account');
+  }
   if (demoDelaySeconds < 1 || demoDelaySeconds > 60) errors.push('DEMO_RETRY_DELAY_SECONDS must be between 1 and 60');
+  if (testDemoCooldownSeconds < 30 || testDemoCooldownSeconds > 3600) errors.push('RAZORPAYX_TEST_DEMO_COOLDOWN_SECONDS must be between 30 and 3600');
 
   if (errors.length) throw new Error(`Unsafe environment configuration: ${errors.join('; ')}`);
   return env;

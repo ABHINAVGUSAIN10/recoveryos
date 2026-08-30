@@ -67,4 +67,17 @@ describe('RecoveryProcessor fault handling', () => {
     await expect(processor.process(job as never)).resolves.toBeUndefined();
     expect(recovery.recordExecutionResult).toHaveBeenCalledWith(execution.id, ExecutionOutcome.SUCCEEDED, response);
   });
+
+  it('routes the dedicated demo action to RazorpayX Test Mode without using the normal recreation adapter', async () => {
+    const providerExecution = { ...execution, actionType: 'RAZORPAYX_TEST_PAYOUT' };
+    const prisma = { actionExecution: { findUniqueOrThrow: jest.fn().mockResolvedValue(providerExecution) }, payoutIncident: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) } };
+    const razorpay = { executeTestDemoPayout: jest.fn().mockResolvedValue({ id: 'pout_demo', status: 'processing' }), executeRecovery: jest.fn() };
+    const recovery = { recordExecutionResult: jest.fn() };
+    const processor = new RecoveryProcessor(prisma as never, razorpay as never, recovery as never);
+
+    await expect(processor.process(job as never)).resolves.toBeUndefined();
+    expect(razorpay.executeTestDemoPayout).toHaveBeenCalledWith(execution.idempotencyKey, execution.incidentId);
+    expect(razorpay.executeRecovery).not.toHaveBeenCalled();
+    expect(recovery.recordExecutionResult).toHaveBeenCalledWith(execution.id, ExecutionOutcome.UNKNOWN, { id: 'pout_demo', status: 'processing' });
+  });
 });

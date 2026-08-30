@@ -2,14 +2,15 @@
 import { useEffect, useMemo, useState } from 'react';
 
 type Incident = { id: string; razorpayPayoutId: string; status: string; amountPaise: number; currentReason?: string; attempts: number; reviewTasks: unknown[]; policyDecisions?: { finalDecision: string }[]; updatedAt: string };
-type Detail = Omit<Incident, 'policyDecisions'> & { auditEvents: { id: string; eventType: string; actorType: string; rationale: string; createdAt: string; decision?: string }[]; analyses: { modelRef: string; promptVersion: string; createdAt: string; outputJson: { category: string; confidence: number; evidenceSummary: string; recommendedAction: string } }[]; policyDecisions: { finalDecision: string; reasonsJson: string[] }[]; executions?: { id: string; outcome: string; scheduledFor: string; createdAt: string }[] };
+type Detail = Omit<Incident, 'policyDecisions'> & { auditEvents: { id: string; eventType: string; actorType: string; rationale: string; createdAt: string; decision?: string }[]; analyses: { modelRef: string; promptVersion: string; createdAt: string; outputJson: { category: string; confidence: number; evidenceSummary: string; recommendedAction: string } }[]; policyDecisions: { finalDecision: string; reasonsJson: string[] }[]; executions?: { id: string; actionType: string; outcome: string; scheduledFor: string; createdAt: string; responseJson?: { id?: string; status?: string } }[] };
 type Metrics = { valueAtRiskPaise: number; recoveredValuePaise: number; recoveryRate: number; eligibleCount: number; eligibleValuePaise: number; recoveredEligibleValuePaise: number; eligibleRecoveryRate: number; pendingRecoveryValuePaise: number; manualReviewValuePaise: number; protectedValuePaise: number; manualInterventions: number; unsafeActionsPrevented: number; unresolvedIncidents: number; statusDistribution: Record<string, number> };
 type Batch = { id: string; name: string; cohortSize: number; startedAt: string; metrics: Metrics };
 type Policy = { version: string; maxAutoRetryAttempts: number; maxAutonomousAmountPaise: number; minimumRetryDelayMinutes: number };
 type DemoScenario = { key: string; title: string; description: string; amountPaise: number; expectedAiAction: string; expectedPolicyDecision: string; humanRequired: boolean };
-type Operations = { status: 'ready' | 'degraded'; simulationMode: boolean; services: { database: boolean; redis: boolean }; queue: { waiting: number; active: number; delayed: number; completed: number; failed: number; paused: number }; ai: { mode: string; configured: boolean; provider: string; model: string; thinkingMode: string; promptVersion: string }; demo: { enabled: boolean; ready: boolean; retryDelaySeconds: number; scenarios: DemoScenario[] }; timestamp: string };
+type Operations = { status: 'ready' | 'degraded'; simulationMode: boolean; services: { database: boolean; redis: boolean }; queue: { waiting: number; active: number; delayed: number; completed: number; failed: number; paused: number }; ai: { mode: string; configured: boolean; provider: string; model: string; thinkingMode: string; promptVersion: string }; demo: { enabled: boolean; ready: boolean; retryDelaySeconds: number; scenarios: DemoScenario[] }; razorpayTestDemo: { enabled: boolean; ready: boolean; testMode: boolean; simulationSafe: boolean; fundAccountConfigured: boolean; policyAllowsAmount: boolean; amountPaise: number; confirmation: string; cooldownSeconds: number }; timestamp: string };
 type IncidentPage = { total: number; page: number; pageSize: number; totalPages: number };
 type DemoRun = { runId: string; scenario: string; retryDelaySeconds: number; duplicateReplayVerified: Record<string, boolean>; batch: Batch; incidents: Detail[] };
+type RazorpayTestDemoRun = { runId: string; amountPaise: number; retryDelaySeconds: number; duplicateReplayVerified: boolean; batch: Batch; incident: Detail };
 type View = 'incidents' | 'batches' | 'demo' | 'policy' | 'operations';
 
 const api = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001/api/v1';
@@ -27,6 +28,9 @@ export default function Dashboard() {
   const [demoRun, setDemoRun] = useState<DemoRun | null>(null);
   const [demoBusy, setDemoBusy] = useState(false);
   const [demoError, setDemoError] = useState('');
+  const [razorpayTestRun, setRazorpayTestRun] = useState<RazorpayTestDemoRun | null>(null);
+  const [razorpayTestBusy, setRazorpayTestBusy] = useState(false);
+  const [razorpayTestError, setRazorpayTestError] = useState('');
   const [incidentPage, setIncidentPage] = useState<IncidentPage>({ total: 0, page: 1, pageSize: 20, totalPages: 1 });
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
@@ -73,8 +77,28 @@ export default function Dashboard() {
     } catch (error) { setDemoError(error instanceof Error ? error.message : 'Live demonstration failed'); }
     finally { setDemoBusy(false); }
   };
+  const runRazorpayTestDemo = async () => {
+    const configuration = operations?.razorpayTestDemo;
+    if (!configuration?.ready) return;
+    const confirmed = window.confirm(`Create one ${money(configuration.amountPaise)} payout using the configured RazorpayX Test Mode balance and dummy fund account? No real money will move.`);
+    if (!confirmed) return;
+    setRazorpayTestBusy(true); setRazorpayTestError('');
+    try {
+      const response = await apiFetch('/razorpayx-test-demo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ confirmation: configuration.confirmation }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(Array.isArray(body.message) ? body.message.join(' ') : body.message || 'RazorpayX Test Mode demonstration failed');
+      setRazorpayTestRun(body); setSelectedBatch(body.batch);
+      setNotice(`Policy-authorized ${money(body.amountPaise)} RazorpayX Test Mode retry scheduled.`);
+      await load();
+    } catch (error) { setRazorpayTestError(error instanceof Error ? error.message : 'RazorpayX Test Mode demonstration failed'); }
+    finally { setRazorpayTestBusy(false); }
+  };
   const openDemoIncident = async (incident: Detail) => {
-    const runSearch = demoRun?.runId || incident.razorpayPayoutId;
+    const runSearch = incident.razorpayPayoutId;
     setSearch(runSearch); setStatusFilter(''); setReviewOnly(false); setView('incidents'); setDetail(incident);
     await load(authToken, 1, { search: runSearch, statusFilter: '', reviewOnly: false });
   };
@@ -92,6 +116,22 @@ export default function Dashboard() {
     }, 1_500);
     return () => window.clearInterval(timer);
   }, [view, demoRun?.runId, demoRun?.incidents.map(incident => incident.status).join('|')]);
+  useEffect(() => {
+    if (view !== 'demo' || !razorpayTestRun || ['RECOVERED', 'FAILED', 'STOPPED', 'REVERSED'].includes(razorpayTestRun.incident.status)) return;
+    const timer = window.setInterval(async () => {
+      try {
+        const [incidentResponse, batchResponse] = await Promise.all([
+          apiFetch(`/incidents/${razorpayTestRun.incident.id}`),
+          apiFetch(`/batches/${razorpayTestRun.batch.id}`),
+        ]);
+        const incident = incidentResponse.ok ? await incidentResponse.json() : razorpayTestRun.incident;
+        const batch = batchResponse.ok ? await batchResponse.json() : razorpayTestRun.batch;
+        setRazorpayTestRun(current => current?.runId === razorpayTestRun.runId ? { ...current, incident, batch } : current);
+        setSelectedBatch(current => current?.id === batch.id ? batch : current);
+      } catch {}
+    }, 2_000);
+    return () => window.clearInterval(timer);
+  }, [view, razorpayTestRun?.runId, razorpayTestRun?.incident.status]);
 
   const liveMetrics = useMemo<Metrics>(() => {
     const atRisk = incidents.reduce((sum, incident) => sum + incident.amountPaise, 0);
@@ -126,7 +166,7 @@ export default function Dashboard() {
     {error && error !== 'AUTH_REQUIRED' && <div className="empty panel">{error}</div>}
     {!error && view === 'incidents' && <section className="content"><div className="panel list"><div className="panel-head"><div><h2>Incident queue</h2><p>{loading ? 'Loading…' : `${incidentPage.total} payout incidents · page ${incidentPage.page} of ${incidentPage.totalPages}`}</p></div><button onClick={() => load()}>Refresh</button></div><div className="filters"><input value={search} onChange={event => setSearch(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') load(authToken, 1); }} placeholder="Search payout ID or reason" aria-label="Search incidents" /><select value={statusFilter} onChange={event => setStatusFilter(event.target.value)} aria-label="Filter by status"><option value="">All statuses</option>{['RECOVERED', 'AUTO_RETRY', 'ESCALATE', 'APPROVAL_REQUIRED', 'PROCESSING', 'STOPPED', 'EXECUTION_UNKNOWN', 'FAILED'].map(status => <option key={status} value={status}>{status.replaceAll('_', ' ')}</option>)}</select><label><input type="checkbox" checked={reviewOnly} onChange={event => setReviewOnly(event.target.checked)} />Open reviews</label><button onClick={() => load(authToken, 1)}>Apply</button><button onClick={() => { const cleared = { search: '', statusFilter: '', reviewOnly: false }; setSearch(''); setStatusFilter(''); setReviewOnly(false); load(authToken, 1, cleared); }}>Clear</button></div><div className="rows">{incidents.map(incident => <button className="row" key={incident.id} onClick={() => open(incident.id)}><span><strong>{incident.razorpayPayoutId}</strong><small>{incident.currentReason || 'No reason supplied'}</small></span><span className={`badge ${tone(incident.status)}`}>{incident.status.replaceAll('_', ' ')}</span><strong>{money(incident.amountPaise)}</strong></button>)}{!loading && !incidents.length && <div className="empty">No incidents match these filters.</div>}</div><div className="pagination"><button disabled={incidentPage.page <= 1} onClick={() => load(authToken, incidentPage.page - 1)}>Previous</button><span>Showing {incidents.length} of {incidentPage.total}</span><button disabled={incidentPage.page >= incidentPage.totalPages} onClick={() => load(authToken, incidentPage.page + 1)}>Next</button></div></div><aside className="panel detail">{detail ? <IncidentDetail detail={detail} onReview={review} /> : <div className="empty"><h2>Select an incident</h2><p>Inspect AI evidence, policy decisions, actions, and the complete audit timeline.</p></div>}</aside></section>}
     {!error && view === 'batches' && <BatchWorkspace batches={batches} selected={selectedBatch} onSelect={setSelectedBatch} onCreate={createBatch} onDownload={downloadBatch} />}
-    {!error && view === 'demo' && <DemoWorkspace operations={operations} run={demoRun} busy={demoBusy} error={demoError} onRun={runDemo} onOpenIncident={openDemoIncident} onOpenBatch={batch => { setSelectedBatch(batch); setView('batches'); }} />}
+    {!error && view === 'demo' && <DemoWorkspace operations={operations} run={demoRun} providerRun={razorpayTestRun} busy={demoBusy} providerBusy={razorpayTestBusy} error={demoError} providerError={razorpayTestError} onRun={runDemo} onRunProvider={runRazorpayTestDemo} onOpenIncident={openDemoIncident} onOpenBatch={batch => { setSelectedBatch(batch); setView('batches'); }} />}
     {!error && view === 'policy' && policy && <PolicyWorkspace policy={policy} onChange={setPolicy} onSave={savePolicy} />}
     {!error && view === 'operations' && <OperationsWorkspace operations={operations} onRefresh={() => load()} />}
   </main>;
@@ -136,8 +176,12 @@ function Metric({ label, value, accent }: { label: string; value: string; accent
 function BatchWorkspace({ batches, selected, onSelect, onCreate, onDownload }: { batches: Batch[]; selected: Batch | null; onSelect: (batch: Batch) => void; onCreate: () => void; onDownload: (batch: Batch, format: 'csv' | 'json') => void }) {
   return <section className="workspace"><div className="panel batch-list"><div className="panel-head"><div><h2>Evaluation batches</h2><p>Reproducible financial evidence</p></div><button onClick={onCreate}>Create from queue</button></div>{batches.length ? batches.map(batch => <button key={batch.id} className={`batch-card ${selected?.id === batch.id ? 'selected' : ''}`} onClick={() => onSelect(batch)}><span><strong>{batch.name}</strong><small>{new Date(batch.startedAt).toLocaleString()} · {batch.cohortSize} cases</small></span><strong>Eligible {(batch.metrics.eligibleRecoveryRate * 100).toFixed(1)}%</strong></button>) : <div className="empty">No batches yet. Create one from the current incident queue.</div>}</div><aside className="panel batch-detail">{selected ? <><div className="panel-head"><div><p className="eyebrow">BATCH EVIDENCE</p><h2>{selected.name}</h2></div><span className="badge neutral">{selected.cohortSize} CASES</span></div><div className="batch-stats expanded"><span>Gross recovered<strong>{money(selected.metrics.recoveredValuePaise)}</strong></span><span>Eligible recovered<strong>{money(selected.metrics.recoveredEligibleValuePaise)}</strong></span><span>Eligible recovery<strong>{(selected.metrics.eligibleRecoveryRate * 100).toFixed(1)}%</strong></span><span>Pending recovery<strong>{money(selected.metrics.pendingRecoveryValuePaise)}</strong></span><span>Protected value<strong>{money(selected.metrics.protectedValuePaise)}</strong></span><span>Manual review value<strong>{money(selected.metrics.manualReviewValuePaise)}</strong></span></div><div className="metric-note">Eligible recovery measures only policy-approved transient failures. Gross recovery includes payouts that arrived already processed.</div><div className="distribution"><p className="eyebrow">OUTCOME DISTRIBUTION</p>{Object.entries(selected.metrics.statusDistribution).map(([status, count]) => <div key={status}><span>{status.replaceAll('_', ' ')}</span><strong>{count}</strong></div>)}</div><div className="actions"><button className="approve" onClick={() => onDownload(selected, 'csv')}>Download CSV</button><button onClick={() => onDownload(selected, 'json')}>Download JSON</button></div></> : <div className="empty">Select a batch to inspect its evidence.</div>}</aside></section>;
 }
-function DemoWorkspace({ operations, run, busy, error, onRun, onOpenIncident, onOpenBatch }: { operations: Operations | null; run: DemoRun | null; busy: boolean; error: string; onRun: (scenario: string) => void; onOpenIncident: (incident: Detail) => void; onOpenBatch: (batch: Batch) => void }) {
+function DemoWorkspace({ operations, run, providerRun, busy, providerBusy, error, providerError, onRun, onRunProvider, onOpenIncident, onOpenBatch }: { operations: Operations | null; run: DemoRun | null; providerRun: RazorpayTestDemoRun | null; busy: boolean; providerBusy: boolean; error: string; providerError: string; onRun: (scenario: string) => void; onRunProvider: () => void; onOpenIncident: (incident: Detail) => void; onOpenBatch: (batch: Batch) => void }) {
   const demo = operations?.demo;
+  const providerDemo = operations?.razorpayTestDemo;
+  const providerExecution = providerRun?.incident.executions?.find(execution => execution.actionType === 'RAZORPAYX_TEST_PAYOUT');
+  const providerPayoutId = providerExecution?.responseJson?.id;
+  const providerStatus = providerExecution?.responseJson?.status;
   const preflight = [
     ['Simulation safety', Boolean(operations?.simulationMode), 'ENABLED'],
     ['Groq hosted model', Boolean(operations?.ai.configured), operations?.ai.model || 'UNAVAILABLE'],
@@ -149,6 +193,14 @@ function DemoWorkspace({ operations, run, busy, error, onRun, onOpenIncident, on
       <div className="panel-head"><div><p className="eyebrow">PRESENTER CONSOLE</p><h2>Live AI decision demonstration</h2><p>Every run creates normal incidents, policy evidence, queue actions, and an auditable batch.</p></div><span className={`badge ${demo?.ready ? 'good' : 'warn'}`}>{demo?.ready ? 'READY' : 'NOT READY'}</span></div>
       <div className="demo-preflight">{preflight.map(([label, ready, detail]) => <article key={label}><span>{label}</span><strong className={ready ? 'state-good' : 'state-warn'}>● {ready ? detail : 'UNAVAILABLE'}</strong></article>)}</div>
       {!demo?.enabled && <div className="demo-warning">Live demo controls are disabled on the API. Set <code>ENABLE_LIVE_DEMO=true</code> only while simulation mode is enabled.</div>}
+      <section className="razorpay-test-card">
+        <div className="razorpay-test-head"><div><p className="eyebrow">REAL PROVIDER · TEST MODE</p><h3>RazorpayX automatic retry</h3><p>AI recommends and policy authorizes a fixed ₹10,000 retry. The worker then creates an actual RazorpayX Test Mode payout to the configured dummy fund account.</p></div><span className={`badge ${providerDemo?.ready ? 'good' : 'warn'}`}>{providerDemo?.ready ? 'READY' : 'NOT READY'}</span></div>
+        <div className="razorpay-test-facts"><span>Amount<strong>{money(providerDemo?.amountPaise ?? 1_000_000)}</strong></span><span>Provider<strong>RAZORPAYX TEST</strong></span><span>Authorization<strong>ADMIN + POLICY</strong></span></div>
+        <button className="approve" disabled={!providerDemo?.ready || providerBusy || busy} onClick={onRunProvider}>{providerBusy ? 'Calling AI and scheduling retry…' : 'Run ₹10,000 RazorpayX test retry'}</button>
+        <small>A confirmation is required. The server enforces Test Mode keys, one configured fund account, idempotency, and a {providerDemo?.cooldownSeconds ?? 300}-second cooldown.</small>
+        {providerError && <div className="demo-error">{providerError}</div>}
+        {providerRun && <div className="razorpay-test-result"><div><span>RecoveryOS incident</span><strong className={tone(providerRun.incident.status) === 'good' ? 'state-good' : 'state-warn'}>{providerRun.incident.status.replaceAll('_', ' ')}</strong></div><div><span>RazorpayX payout</span><strong>{providerPayoutId ? `pout_…${providerPayoutId.slice(-6)}` : 'QUEUED'}</strong></div><div><span>Provider status</span><strong>{providerStatus?.toUpperCase() || 'WAITING'}</strong></div><div><span>Duplicate replay</span><strong>{providerRun.duplicateReplayVerified ? 'BLOCKED' : 'VERIFYING'}</strong></div><p>{providerRun.incident.status === 'RECOVERED' ? 'RazorpayX confirmed the payout as processed. RecoveryOS closed the same incident.' : providerStatus === 'processing' ? 'The payout is visible in RazorpayX Test Mode. Advance it to processed there; the signed webhook will update this card automatically.' : 'RecoveryOS is running AI classification, deterministic authorization, and the durable retry action.'}</p><div className="actions compact"><button onClick={() => onOpenIncident(providerRun.incident)}>Open incident</button><button onClick={() => onOpenBatch(providerRun.batch)}>Open evidence</button></div></div>}
+      </section>
       <div className="demo-scenarios">{demo?.scenarios.map(scenario => <article key={scenario.key} className="demo-scenario"><div><p className="eyebrow">{scenario.humanRequired ? 'HUMAN GATE' : 'AUTONOMOUS PATH'}</p><h3>{scenario.title}</h3><p>{scenario.description}</p></div><dl><div><dt>Amount</dt><dd>{money(scenario.amountPaise)}</dd></div><div><dt>Expected AI</dt><dd>{scenario.expectedAiAction}</dd></div><div><dt>Expected policy</dt><dd>{scenario.expectedPolicyDecision.replaceAll('_', ' ')}</dd></div></dl><button disabled={!demo.ready || busy} onClick={() => onRun(scenario.key)}>{busy ? 'Running…' : 'Run scenario'}</button></article>)}</div>
       <div className="demo-run-all"><button className="approve" disabled={!demo?.ready || busy} onClick={() => onRun('ALL')}>{busy ? 'Calling Groq and evaluating policy…' : 'Run all four scenarios'}</button><span>Autonomous retries use transparent simulation time compression: policy delay → {demo?.retryDelaySeconds ?? 5} seconds.</span></div>
       {error && <div className="demo-error">{error}</div>}

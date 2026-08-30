@@ -6,18 +6,26 @@ import { Decision, ExecutionOutcome, IncidentStatus, Prisma, ReviewStatus } from
 import { aiProposalSchema, evaluatePolicy, incidentSchema, policyConfigSchema, type Incident, type PolicyConfig } from '@recoveryos/domain';
 import { PrismaService } from './prisma.service';
 import { AiService } from './ai.service';
-import { incidentIdFromRecoveryReference, RazorpayExecutionUncertainError, RazorpayService, recoveryIdempotencyKey } from './razorpay.service';
+import {
+  incidentIdFromRecoveryReference,
+  RAZORPAYX_TEST_DEMO_AMOUNT_PAISE,
+  RAZORPAYX_TEST_DEMO_CONFIRMATION,
+  RazorpayExecutionUncertainError,
+  RazorpayService,
+  recoveryIdempotencyKey,
+} from './razorpay.service';
 import { safeErrorMessage } from './redaction';
 import { DEMO_SCENARIOS, demoScenarioSchema } from './demo-scenarios';
 
 const DEFAULT_POLICY: PolicyConfig = { version: 'v1.0.0', maxAutoRetryAttempts: 2, maxAutonomousAmountPaise: 1_000_000, minimumRetryDelayMinutes: 30 };
 type BatchWithIncidents = Prisma.BatchRunGetPayload<{ include: { results: { include: { incident: { include: { analyses: { orderBy: { createdAt: 'desc' }, take: 1 }, policyDecisions: { orderBy: { createdAt: 'desc' }, take: 1 } } } } } } }>;
 type IncidentListQuery = { page?: number; pageSize?: number; search?: string; status?: string; reviewRequired?: boolean };
-type DemoAnalysisContext = { runId: string; actorId: string; retryDelaySeconds: number };
+type DemoAnalysisContext = { runId: string; actorId: string; retryDelaySeconds: number; executionMode?: 'SIMULATED' | 'RAZORPAYX_TEST' };
 @Injectable()
 export class RecoveryService implements OnApplicationBootstrap {
   private readonly logger = new Logger(RecoveryService.name);
   private demoRunActive = false;
+  private razorpayTestDemoActive = false;
   constructor(private readonly prisma: PrismaService, private readonly ai: AiService, private readonly razorpay: RazorpayService, @InjectQueue('recovery') private readonly queue: Queue) {}
   async onApplicationBootstrap() {
     try {
@@ -42,6 +50,12 @@ export class RecoveryService implements OnApplicationBootstrap {
     const ai = this.ai.status();
     const demoEnabled = process.env.ENABLE_LIVE_DEMO === 'true';
     const simulationMode = process.env.SIMULATION_MODE !== 'false';
+    const providerConfiguration = this.razorpay.testDemoConfiguration();
+    let providerPolicyAllowsAmount = false;
+    if (services.database) {
+      try { providerPolicyAllowsAmount = (await this.getPolicy()).maxAutonomousAmountPaise >= RAZORPAYX_TEST_DEMO_AMOUNT_PAISE; }
+      catch {}
+    }
     return {
       status: services.database && services.redis ? 'ready' : 'degraded',
       simulationMode, services, queue, ai,
@@ -50,6 +64,12 @@ export class RecoveryService implements OnApplicationBootstrap {
         ready: demoEnabled && simulationMode && services.database && services.redis && ai.configured,
         retryDelaySeconds: Number.parseInt(process.env.DEMO_RETRY_DELAY_SECONDS || '5', 10),
         scenarios: DEMO_SCENARIOS.map(({ key, title, description, amountPaise, expectedAiAction, expectedPolicyDecision, humanRequired }) => ({ key, title, description, amountPaise, expectedAiAction, expectedPolicyDecision, humanRequired })),
+      },
+      razorpayTestDemo: {
+        ...providerConfiguration,
+        policyAllowsAmount: providerPolicyAllowsAmount,
+        cooldownSeconds: Number.parseInt(process.env.RAZORPAYX_TEST_DEMO_COOLDOWN_SECONDS || '300', 10),
+        ready: providerConfiguration.ready && providerPolicyAllowsAmount && services.database && services.redis && ai.configured,
       },
       timestamp: new Date().toISOString(),
     };
@@ -100,6 +120,76 @@ export class RecoveryService implements OnApplicationBootstrap {
       return { runId, scenario: parsed.data, retryDelaySeconds, duplicateReplayVerified, batch, incidents };
     } finally {
       this.demoRunActive = false;
+    }
+  }
+
+  async runRazorpayTestDemo(confirmation: string, actorId = 'admin') {
+    if (confirmation !== RAZORPAYX_TEST_DEMO_CONFIRMATION) throw new BadRequestException('Explicit ₹10,000 Test Mode payout confirmation is required');
+    const configuration = this.razorpay.testDemoConfiguration();
+    if (!configuration.enabled) throw new ForbiddenException('RazorpayX Test Mode demonstration is disabled');
+    if (!configuration.ready) throw new ServiceUnavailableException('RazorpayX Test Mode demonstration is not safely configured');
+    if (!this.ai.status().configured) throw new ServiceUnavailableException('A hosted AI provider must be configured for the RazorpayX demonstration');
+    if (this.razorpayTestDemoActive) throw new ConflictException('Another RazorpayX Test Mode demonstration is already running');
+
+    const policy = await this.getPolicy();
+    if (policy.maxAutonomousAmountPaise < RAZORPAYX_TEST_DEMO_AMOUNT_PAISE) {
+      throw new ConflictException('The active policy amount cap does not authorize an autonomous ₹10,000 retry');
+    }
+    if (policy.maxAutoRetryAttempts < 1) throw new ConflictException('The active policy does not authorize automatic retries');
+
+    const cooldownSeconds = Number.parseInt(process.env.RAZORPAYX_TEST_DEMO_COOLDOWN_SECONDS || '300', 10);
+    const [openExecution, recent] = await Promise.all([
+      this.prisma.actionExecution.findFirst({
+        where: { actionType: 'RAZORPAYX_TEST_PAYOUT', outcome: { in: [ExecutionOutcome.PENDING, ExecutionOutcome.UNKNOWN] } },
+        orderBy: { createdAt: 'desc' },
+      }),
+      this.prisma.actionExecution.findFirst({
+        where: {
+          actionType: 'RAZORPAYX_TEST_PAYOUT',
+          createdAt: { gte: new Date(Date.now() - cooldownSeconds * 1_000) },
+        },
+        orderBy: { createdAt: 'desc' },
+      }),
+    ]);
+    if (openExecution) throw new ConflictException('A RazorpayX Test Mode payout is still pending provider confirmation; reconcile it before another run');
+    if (recent) throw new ConflictException(`A RazorpayX Test Mode payout was already requested within the ${cooldownSeconds}-second safety window`);
+
+    const runId = `rx_demo_${Date.now().toString(36)}_${randomBytes(3).toString('hex')}`;
+    const retryDelaySeconds = Number.parseInt(process.env.DEMO_RETRY_DELAY_SECONDS || '5', 10);
+    const eventId = `evt_${runId}_temporary_failure`;
+    const payoutId = `pout_seed_${runId}`;
+    const payload = {
+      event_id: eventId,
+      event: 'recoveryos.demo.payout.failed',
+      payload: { payout: { entity: {
+        id: payoutId,
+        amount: RAZORPAYX_TEST_DEMO_AMOUNT_PAISE,
+        currency: 'INR',
+        status: 'failed',
+        reference_id: `recoveryos-test-${runId}`,
+        status_details: { description: 'Temporary beneficiary bank technical failure' },
+        notes: { recoveryos_demo_run: runId, recoveryos_demo_scenario: 'RAZORPAYX_TEST_RETRY' },
+      } } },
+    };
+
+    this.razorpayTestDemoActive = true;
+    try {
+      const context: DemoAnalysisContext = { runId, actorId, retryDelaySeconds, executionMode: 'RAZORPAYX_TEST' };
+      const first = await this.ingestWebhook(eventId, payload.event, payload, context);
+      const replay = await this.ingestWebhook(eventId, payload.event, payload);
+      if (!first.incidentId) throw new Error('RazorpayX Test Mode demonstration did not create an incident');
+      const batch = await this.createBatch(`RazorpayX Test Demo ${runId}`, [first.incidentId]);
+      const incident = await this.incidentDetail(first.incidentId);
+      return {
+        runId,
+        amountPaise: RAZORPAYX_TEST_DEMO_AMOUNT_PAISE,
+        retryDelaySeconds,
+        duplicateReplayVerified: replay.duplicate && replay.incidentId === first.incidentId,
+        batch,
+        incident,
+      };
+    } finally {
+      this.razorpayTestDemoActive = false;
     }
   }
   async recoverPendingExecutions() {
@@ -154,7 +244,7 @@ export class RecoveryService implements OnApplicationBootstrap {
           return response?.id === payoutId;
         }) ?? recoveryExecutions.find(execution => {
           const response = execution.responseJson as { id?: unknown } | null;
-          return execution.outcome === ExecutionOutcome.UNKNOWN && typeof response?.id !== 'string';
+          return (execution.outcome === ExecutionOutcome.PENDING || execution.outcome === ExecutionOutcome.UNKNOWN) && typeof response?.id !== 'string';
         }) ?? null;
         const linkedRecovery = Boolean(recoveryIncidentId && recoveryExecution);
         const incident = linkedRecovery
@@ -172,8 +262,16 @@ export class RecoveryService implements OnApplicationBootstrap {
           });
         }
         const event = await db.payoutEvent.create({ data: { externalEventId, eventType, payloadJson: payload, payoutIncidentId: incident.id } });
-        await this.audit(db, incident.id, 'WEBHOOK_RECEIVED', 'SYSTEM', `Provider event ${eventType} persisted`, { externalEventId, eventId: event.id });
-        if (demoContext) await this.audit(db, incident.id, 'DEMO_SCENARIO_STARTED', 'HUMAN', `Live demonstration ${demoContext.runId} started by ${demoContext.actorId}`, { runId: demoContext.runId }, undefined, undefined, demoContext.actorId);
+        const seededProviderDemo = demoContext?.executionMode === 'RAZORPAYX_TEST';
+        await this.audit(
+          db,
+          incident.id,
+          seededProviderDemo ? 'DEMO_FAILURE_SEEDED' : 'WEBHOOK_RECEIVED',
+          'SYSTEM',
+          seededProviderDemo ? 'Controlled temporary-failure seed persisted for a RazorpayX Test Mode recovery demonstration.' : `Provider event ${eventType} persisted`,
+          { externalEventId, eventId: event.id },
+        );
+        if (demoContext) await this.audit(db, incident.id, 'DEMO_SCENARIO_STARTED', 'HUMAN', `${seededProviderDemo ? 'RazorpayX Test Mode' : 'Live'} demonstration ${demoContext.runId} started by ${demoContext.actorId}`, { runId: demoContext.runId, executionMode: demoContext.executionMode || 'SIMULATED' }, undefined, undefined, demoContext.actorId);
         return { incident, linkedRecovery };
       });
     } catch (error) {
@@ -208,12 +306,15 @@ export class RecoveryService implements OnApplicationBootstrap {
     const incident = await this.prisma.payoutIncident.findUniqueOrThrow({ where: { id: incidentId } });
     const key = recoveryIdempotencyKey(incident.id, incident.attempts + 1);
     const scheduledFor = new Date(Date.now() + (demoContext ? demoContext.retryDelaySeconds * 1_000 : delayMinutes * 60_000));
-    const execution = await this.prisma.actionExecution.upsert({ where: { idempotencyKey: key }, update: {}, create: { incidentId, actionType: 'RETRY_PAYOUT', idempotencyKey: key, requestHash: createHash('sha256').update(`${incident.razorpayPayoutId}:${key}`).digest('hex'), scheduledFor } });
+    const actionType = demoContext?.executionMode === 'RAZORPAYX_TEST' ? 'RAZORPAYX_TEST_PAYOUT' : 'RETRY_PAYOUT';
+    const execution = await this.prisma.actionExecution.upsert({ where: { idempotencyKey: key }, update: {}, create: { incidentId, actionType, idempotencyKey: key, requestHash: createHash('sha256').update(`${incident.razorpayPayoutId}:${key}:${actionType}`).digest('hex'), scheduledFor } });
     await this.enqueueExecution(execution.id, execution.scheduledFor);
-    const rationale = demoContext
-      ? `Policy delay ${delayMinutes} minutes compressed to ${demoContext.retryDelaySeconds} seconds for simulation demo ${demoContext.runId}`
+    const rationale = demoContext?.executionMode === 'RAZORPAYX_TEST'
+      ? `Policy-authorized ₹10,000 RazorpayX Test Mode retry scheduled after a ${demoContext.retryDelaySeconds}-second presentation delay; the policy delay remains ${delayMinutes} minutes.`
+      : demoContext
+        ? `Policy delay ${delayMinutes} minutes compressed to ${demoContext.retryDelaySeconds} seconds for simulation demo ${demoContext.runId}`
       : `Retry scheduled in ${delayMinutes} minutes`;
-    await this.prisma.auditEvent.create({ data: { incidentId, eventType: 'ACTION_REQUESTED', actorType: 'SYSTEM', rationale, dataJson: { executionId: execution.id, idempotencyKey: key, policyDelayMinutes: delayMinutes, effectiveDelaySeconds: demoContext?.retryDelaySeconds, demoRunId: demoContext?.runId } } });
+    await this.prisma.auditEvent.create({ data: { incidentId, eventType: 'ACTION_REQUESTED', actorType: 'SYSTEM', rationale, amountPaise: incident.amountPaise, dataJson: { executionId: execution.id, actionType, idempotencyKey: key, policyDelayMinutes: delayMinutes, effectiveDelaySeconds: demoContext?.retryDelaySeconds, demoRunId: demoContext?.runId } } });
   }
   private async enqueueExecution(executionId: string, scheduledFor: Date) {
     const delay = Math.max(0, scheduledFor.getTime() - Date.now());
@@ -264,8 +365,12 @@ export class RecoveryService implements OnApplicationBootstrap {
         const recoveryPayoutId = typeof previousResponse?.id === 'string' ? previousResponse.id : null;
         const providerPayout = execution
           ? recoveryPayoutId
-            ? await this.razorpay.fetchPayout(recoveryPayoutId)
-            : await this.razorpay.executeRecovery(execution.idempotencyKey, incident.razorpayPayoutId, incident.id)
+            ? execution.actionType === 'RAZORPAYX_TEST_PAYOUT'
+              ? await this.razorpay.fetchTestDemoPayout(recoveryPayoutId)
+              : await this.razorpay.fetchPayout(recoveryPayoutId)
+            : execution.actionType === 'RAZORPAYX_TEST_PAYOUT'
+              ? await this.razorpay.executeTestDemoPayout(execution.idempotencyKey, incident.id)
+              : await this.razorpay.executeRecovery(execution.idempotencyKey, incident.razorpayPayoutId, incident.id)
           : await this.razorpay.fetchPayout(incident.razorpayPayoutId);
         const providerStatus = String(providerPayout?.status ?? '').toUpperCase();
         const status = this.incidentStatusFromProvider(providerStatus, IncidentStatus.EXECUTION_UNKNOWN);

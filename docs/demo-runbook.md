@@ -23,6 +23,21 @@ Each scenario uses a unique synthetic payout/event identifier, replays the same 
 
 For the autonomous case, `DEMO_RETRY_DELAY_SECONDS` compresses the execution wait only in simulation mode. The policy's original delay remains unchanged and both values are written to `ACTION_REQUESTED`. Never describe the simulated provider execution as a real-money payout; the live elements are the hosted AI call, deterministic policy, PostgreSQL transaction, Redis/BullMQ scheduling, worker processing, and dashboard updates.
 
+## RazorpayX Test Mode automatic-retry demonstration
+
+This is a separate, administrator-only path on the same presenter page. It deliberately leaves global `SIMULATION_MODE=true` while permitting one narrowly scoped provider call:
+
+1. Configure a RazorpayX Test Mode key pair, the webhook secret, and the exact dedicated dummy fund account in `RAZORPAYX_TEST_DEMO_FUND_ACCOUNT_ID`.
+2. Keep token authentication enabled and ensure the active autonomous amount cap is at least 1,000,000 paise.
+3. Set `ENABLE_RAZORPAYX_TEST_DEMO=true` and restart the API.
+4. Sign in to RecoveryOS with the administrator token and click **Run ₹10,000 RazorpayX test retry**.
+5. Confirm the warning. RecoveryOS persists a clearly labelled controlled-failure seed, calls the hosted model, applies deterministic policy, and schedules a durable action.
+6. The dedicated worker action locates a Test Mode balance with at least ₹10,000, verifies the configured fund account is active, and submits exactly 1,000,000 paise with an idempotency key.
+7. Open RazorpayX in Test Mode. The payout appears there against the dummy balance and configured fund account. If Razorpay leaves it in `processing`, advance it to `processed` in the Test Mode dashboard.
+8. The signed Razorpay webhook links the provider payout back to the original RecoveryOS incident. The presenter card changes to `RECOVERED` only after the terminal provider confirmation.
+
+Be precise during the presentation: the initial temporary failure is a controlled demonstration seed; the recovery payout, its RazorpayX lifecycle, webhook, and dashboard/account-statement evidence are genuine Test Mode provider interactions. No real money moves. The endpoint refuses live credentials and applies an administrator gate, fixed amount, exact destination, cooldown, policy cap, duplicate controls, and durable idempotency.
+
 For an ambiguous or timed-out execution, call `POST /api/v1/reconcile`. RecoveryOS queries the provider and records a terminal outcome when one is confirmed; it never creates another payout while the provider remains uncertain.
 
 Batch metrics are derived from the current incident outcomes rather than the original batch snapshots. This ensures a retry that later succeeds is reflected in recovered value while preserving the original cohort and value-at-risk denominator.

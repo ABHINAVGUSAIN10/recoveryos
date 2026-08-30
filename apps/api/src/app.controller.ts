@@ -34,6 +34,7 @@ export class AppController {
   @Get('/policies') policy() { return this.recovery.getPolicy(); }
   @Get('/operations') operations() { return this.recovery.operations(); }
   @Roles('OPERATOR') @Post('/demo-runs') demoRun(@Req() req: AuthenticatedRequest, @Body('scenario') scenario?: string) { return this.recovery.runLiveDemo(scenario || 'ALL', req.recoveryActor?.id); }
+  @Roles('ADMIN') @Post('/razorpayx-test-demo') razorpayTestDemo(@Req() req: AuthenticatedRequest, @Body('confirmation') confirmation?: string) { return this.recovery.runRazorpayTestDemo(confirmation || '', req.recoveryActor?.id); }
   @Roles('ADMIN') @Put('/policies') updatePolicy(@Req() req: AuthenticatedRequest, @Body() body: unknown) { return this.recovery.updatePolicy(policyConfigSchema.parse(body), req.recoveryActor?.id); }
   @Roles('OPERATOR') @Post('/batches') batch(@Body('name') name: string, @Body('incidentIds') incidentIds: string[]) { return this.recovery.createBatch(name || `Batch ${new Date().toISOString()}`, incidentIds || []); }
   @Get('/batches') batches() { return this.recovery.listBatches(); }

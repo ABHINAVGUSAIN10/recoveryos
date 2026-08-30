@@ -31,6 +31,13 @@ export type RazorpayPayout = {
   [key: string]: unknown;
 };
 
+type BankingBalance = { account_number?: string; available_amount?: number };
+type FundAccount = { id?: string; active?: boolean; account_type?: string };
+type Collection<T> = { items?: T[] };
+
+export const RAZORPAYX_TEST_DEMO_AMOUNT_PAISE = 1_000_000;
+export const RAZORPAYX_TEST_DEMO_CONFIRMATION = 'CREATE INR 10000 TEST PAYOUT';
+
 export class RazorpayExecutionUncertainError extends Error {
   override name = 'RazorpayExecutionUncertainError';
 }
@@ -62,6 +69,22 @@ export function incidentIdFromRecoveryReference(referenceId: unknown) {
 @Injectable()
 export class RazorpayService {
   private get simulation() { return process.env.SIMULATION_MODE !== 'false'; }
+
+  testDemoConfiguration() {
+    const enabled = process.env.ENABLE_RAZORPAYX_TEST_DEMO === 'true';
+    const simulationSafe = this.simulation;
+    const testCredentials = Boolean(process.env.RAZORPAY_KEY_ID?.startsWith('rzp_test_') && process.env.RAZORPAY_KEY_SECRET);
+    const fundAccountConfigured = Boolean(process.env.RAZORPAYX_TEST_DEMO_FUND_ACCOUNT_ID?.startsWith('fa_'));
+    return {
+      enabled,
+      ready: enabled && simulationSafe && testCredentials && fundAccountConfigured,
+      testMode: testCredentials,
+      simulationSafe,
+      fundAccountConfigured,
+      amountPaise: RAZORPAYX_TEST_DEMO_AMOUNT_PAISE,
+      confirmation: RAZORPAYX_TEST_DEMO_CONFIRMATION,
+    };
+  }
 
   async fetchPayout(payoutId: string): Promise<RazorpayPayout> {
     if (this.simulation) return { id: payoutId, status: 'processed', status_details: { description: 'Simulated payout' } };
@@ -124,7 +147,47 @@ export class RazorpayService {
     }, idempotencyKey);
   }
 
-  private async request(path: string, method: 'GET' | 'POST', body?: unknown, idempotencyKey?: string): Promise<RazorpayPayout> {
+  async executeTestDemoPayout(idempotencyKey: string, incidentId: string): Promise<RazorpayPayout> {
+    const configuration = this.testDemoConfiguration();
+    if (!configuration.ready) throw new RazorpayRecoveryBlockedError('RazorpayX Test Mode demonstration is not safely configured.');
+
+    const balances = await this.request<Collection<BankingBalance>>('/v1/banking_balances?count=100', 'GET');
+    const source = balances.items?.find(item =>
+      typeof item.account_number === 'string'
+      && item.account_number.length > 0
+      && Number(item.available_amount) >= RAZORPAYX_TEST_DEMO_AMOUNT_PAISE,
+    );
+    if (!source?.account_number) throw new RazorpayRecoveryBlockedError('No RazorpayX Test Mode account has the required dummy balance.');
+
+    const configuredFundAccountId = process.env.RAZORPAYX_TEST_DEMO_FUND_ACCOUNT_ID!;
+    const fundAccounts = await this.request<Collection<FundAccount>>('/v1/fund_accounts?count=100', 'GET');
+    const fundAccount = fundAccounts.items?.find(item =>
+      item.id === configuredFundAccountId
+      && item.active !== false
+      && ['vpa', 'bank_account'].includes(item.account_type || ''),
+    );
+    if (!fundAccount?.id || !fundAccount.account_type) throw new RazorpayRecoveryBlockedError('The configured RazorpayX Test Mode fund account is unavailable or inactive.');
+
+    return this.request<RazorpayPayout>('/v1/payouts', 'POST', {
+      account_number: source.account_number,
+      fund_account_id: fundAccount.id,
+      amount: RAZORPAYX_TEST_DEMO_AMOUNT_PAISE,
+      currency: 'INR',
+      mode: fundAccount.account_type === 'vpa' ? 'UPI' : 'IMPS',
+      purpose: 'payout',
+      queue_if_low_balance: false,
+      reference_id: recoveryReferenceId(incidentId),
+      narration: 'RecoveryOS test retry',
+      notes: { recovery_incident_id: incidentId, recoveryos_demo: 'razorpayx_test_retry' },
+    }, idempotencyKey);
+  }
+
+  async fetchTestDemoPayout(payoutId: string): Promise<RazorpayPayout> {
+    if (!this.testDemoConfiguration().ready) throw new RazorpayRecoveryBlockedError('RazorpayX Test Mode demonstration is not safely configured.');
+    return this.request<RazorpayPayout>(`/v1/payouts/${encodeURIComponent(payoutId)}`, 'GET');
+  }
+
+  private async request<T = RazorpayPayout>(path: string, method: 'GET' | 'POST', body?: unknown, idempotencyKey?: string): Promise<T> {
     const key = process.env.RAZORPAY_KEY_ID;
     const secret = process.env.RAZORPAY_KEY_SECRET;
     if (!key || !secret) throw new Error('Razorpay credentials are not configured');
@@ -147,7 +210,7 @@ export class RazorpayService {
         if (method === 'POST' && result.status >= 500) throw new RazorpayExecutionUncertainError(`Razorpay payout request returned status ${result.status}; outcome requires reconciliation.`);
         throw new Error(`Razorpay request failed with status ${result.status}`);
       }
-      return await result.json() as RazorpayPayout;
+      return await result.json() as T;
     } catch (error) {
       if (error instanceof RazorpayExecutionUncertainError || (error instanceof Error && error.message.startsWith('Razorpay request failed with status'))) throw error;
       throw new RazorpayExecutionUncertainError('Razorpay request did not return a confirmed outcome; reconciliation is required.');

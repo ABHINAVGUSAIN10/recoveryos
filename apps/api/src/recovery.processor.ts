@@ -21,7 +21,9 @@ export class RecoveryProcessor extends WorkerHost {
     const claimed = await this.prisma.payoutIncident.updateMany({ where: { id: execution.incidentId, status: IncidentStatus.AUTO_RETRY }, data: { status: IncidentStatus.EXECUTING } });
     if (!claimed.count) return;
     try {
-      const response = await this.razorpay.executeRecovery(execution.idempotencyKey, execution.incident.razorpayPayoutId, execution.incidentId);
+      const response = execution.actionType === 'RAZORPAYX_TEST_PAYOUT'
+        ? await this.razorpay.executeTestDemoPayout(execution.idempotencyKey, execution.incidentId)
+        : await this.razorpay.executeRecovery(execution.idempotencyKey, execution.incident.razorpayPayoutId, execution.incidentId);
       const providerStatus = String(response?.status ?? '').toLowerCase();
       const outcome = providerStatus === 'processed'
         ? ExecutionOutcome.SUCCEEDED

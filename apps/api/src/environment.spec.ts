@@ -64,4 +64,28 @@ describe('validateEnvironment', () => {
     expect(() => validateEnvironment({ ...base, DEMO_RETRY_DELAY_SECONDS: '0' }))
       .toThrow('DEMO_RETRY_DELAY_SECONDS must be between 1 and 60');
   });
+
+  it('accepts the separately guarded RazorpayX Test Mode demonstration', () => {
+    expect(validateEnvironment({
+      ...base,
+      AUTH_MODE: 'token',
+      VIEWER_API_TOKEN: 'v'.repeat(32),
+      OPERATOR_API_TOKEN: 'o'.repeat(32),
+      ADMIN_API_TOKEN: 'a'.repeat(32),
+      ENABLE_RAZORPAYX_TEST_DEMO: 'true',
+      RAZORPAY_KEY_ID: 'rzp_test_safe',
+      RAZORPAY_KEY_SECRET: 's'.repeat(32),
+      RAZORPAYX_TEST_DEMO_FUND_ACCOUNT_ID: 'fa_demo',
+    })).toMatchObject({ SIMULATION_MODE: 'true', ENABLE_RAZORPAYX_TEST_DEMO: 'true' });
+  });
+
+  it('rejects the provider demo with live keys or disabled authentication', () => {
+    expect(() => validateEnvironment({
+      ...base,
+      ENABLE_RAZORPAYX_TEST_DEMO: 'true',
+      RAZORPAY_KEY_ID: 'rzp_live_unsafe',
+      RAZORPAY_KEY_SECRET: 's'.repeat(32),
+      RAZORPAYX_TEST_DEMO_FUND_ACCOUNT_ID: 'fa_demo',
+    })).toThrow('AUTH_MODE=token');
+  });
 });

@@ -152,7 +152,14 @@ export class RecoveryService implements OnApplicationBootstrap {
   }
   private async enqueueExecution(executionId: string, scheduledFor: Date) {
     const delay = Math.max(0, scheduledFor.getTime() - Date.now());
-    await this.queue.add('execute-retry', { executionId }, { jobId: executionId, delay, attempts: 3, backoff: { type: 'exponential', delay: 1000 } });
+    await this.queue.add('execute-retry', { executionId }, {
+      jobId: executionId,
+      delay,
+      attempts: 3,
+      backoff: { type: 'exponential', delay: 1000 },
+      removeOnComplete: { age: 7 * 24 * 60 * 60, count: 1_000 },
+      removeOnFail: { age: 30 * 24 * 60 * 60, count: 1_000 },
+    });
   }
   async decideReview(incidentId: string, approved: boolean, actorId = 'operator') {
     const task = await this.prisma.reviewTask.findFirst({ where: { incidentId, status: ReviewStatus.OPEN }, orderBy: { createdAt: 'desc' } }); if (!task) throw new Error('No open review task');

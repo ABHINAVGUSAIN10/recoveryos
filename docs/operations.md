@@ -75,7 +75,7 @@ Run the six-case smoke evaluation with `pnpm ai:evaluate -- --require-live`. Run
 ## Operator response
 
 1. If PostgreSQL is degraded, stop approvals and retries, check Neon status and connection limits, and preserve the existing incident/action state.
-2. If Redis is degraded, the API remains the system of record but delayed execution pauses; restore Redis and inspect waiting, delayed, and failed counts before resuming.
+2. If Redis is degraded, the API remains the system of record but delayed execution pauses; inspect the private `redis` container and volume, restore Redis, then inspect waiting, delayed, and failed counts before resuming. Application startup requeues durable pending action intents from PostgreSQL.
 3. If AI is unavailable, accept the fail-closed advisory and route the incident to human review. Do not weaken policy to compensate.
 4. If Razorpay execution is uncertain, leave the incident `EXECUTION_UNKNOWN` and run authenticated reconciliation. Never create a fresh-key payout to test the connection. Reconciliation fetches a known recovery payout or repeats the identical create request with its original idempotency key.
 5. Correlate proxy and API logs using `x-request-id`, then record any manual decision in the incident audit trail.

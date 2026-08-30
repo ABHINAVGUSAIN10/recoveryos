@@ -138,7 +138,11 @@ describe('RecoveryService durable ingestion and execution recovery', () => {
     jest.spyOn(service, 'recordExecutionResult').mockResolvedValue({ recorded: true, incidentId: 'incident-2' } as never);
 
     await expect(service.recoverPendingExecutions()).resolves.toEqual({ scanned: 3, requeued: 1, uncertain: 1, ignored: 1 });
-    expect(queue.add).toHaveBeenCalledWith('execute-retry', { executionId: 'execution-1' }, expect.objectContaining({ jobId: 'execution-1' }));
+    expect(queue.add).toHaveBeenCalledWith('execute-retry', { executionId: 'execution-1' }, expect.objectContaining({
+      jobId: 'execution-1',
+      removeOnComplete: { age: 7 * 24 * 60 * 60, count: 1_000 },
+      removeOnFail: { age: 30 * 24 * 60 * 60, count: 1_000 },
+    }));
     expect(service.recordExecutionResult).toHaveBeenCalledWith('execution-2', ExecutionOutcome.UNKNOWN, expect.objectContaining({ error: expect.stringContaining('reconciliation') }));
   });
 

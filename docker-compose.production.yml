@@ -1,4 +1,34 @@
 services:
+  redis:
+    image: redis:7.2-alpine
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      - --maxmemory
+      - 128mb
+      - --maxmemory-policy
+      - noeviction
+    restart: unless-stopped
+    expose:
+      - "6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
   api:
     build:
       context: .
@@ -7,6 +37,12 @@ services:
     environment:
       NODE_ENV: production
       PORT: "3001"
+      # Production BullMQ runs on the private Compose network. This intentionally
+      # overrides any legacy hosted REDIS_URL that may remain in env_file.
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
     restart: unless-stopped
     expose:
       - "3001"
@@ -80,5 +116,6 @@ services:
         max-file: "5"
 
 volumes:
+  redis_data:
   caddy_data:
   caddy_config:

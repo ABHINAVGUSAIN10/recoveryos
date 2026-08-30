@@ -8,13 +8,13 @@
 
 The DNS A record must point to the Elastic IP, and the EC2 security group must allow inbound TCP traffic on ports 80 and 443 before Caddy can issue and renew the TLS certificate.
 
-This procedure deploys the simulator-first application to one Ubuntu EC2 instance while continuing to use hosted Neon PostgreSQL and Upstash Redis. Only Caddy exposes host ports; the API and web containers are reachable through the private Compose network. Caddy obtains and renews TLS certificates after the domain resolves to the instance.
+This procedure deploys the simulator-first application to one Ubuntu EC2 instance with hosted Neon PostgreSQL and a private persistent Redis container for BullMQ. Only Caddy exposes host ports; Redis, the API, and the web container are reachable only through the private Compose network. Caddy obtains and renews TLS certificates after the domain resolves to the instance.
 
 ## Required accounts and values
 
 - An AWS account with permission to create EC2, a security group, and an Elastic IP.
 - A domain or subdomain whose DNS `A` record you can edit.
-- The existing Neon PostgreSQL TLS URL and Upstash Redis `rediss://` URL.
+- The existing Neon PostgreSQL TLS URL. Production Compose supplies its own private Redis service and persistent volume.
 - Three independent random bearer tokens and a random Razorpay webhook secret.
 - A supported OpenAI-compatible provider key only when live advisory evaluation is desired. It is not required for deployment.
 
@@ -45,7 +45,7 @@ chmod 600 .env.production
 Edit `.env.production` privately:
 
 - Set `RECOVERYOS_DOMAIN` and the matching `https://...` value in `ALLOWED_ORIGINS`.
-- Set the Neon `DATABASE_URL` and Upstash `REDIS_URL`.
+- Set the Neon `DATABASE_URL`. Keep `REDIS_URL=redis://redis:6379`; Compose also overrides legacy hosted values with the private service address.
 - Generate each token and the webhook secret independently, for example with `openssl rand -hex 32`.
 - Leave `SIMULATION_MODE=true`.
 - Leave `AI_API_KEY` empty until a live advisory evaluation is scheduled.
@@ -78,6 +78,7 @@ Verify:
 3. The dashboard requires a bearer token and displays the simulation banner.
 4. The Operations tab reports PostgreSQL, Redis, queue counts, simulation enabled, and the configured advisory mode.
 5. Ports 3000 and 3001 are not reachable directly from the internet.
+6. Port 6379 is not published on the host; `docker compose exec redis redis-cli ping` returns `PONG`.
 
 Caddy's reverse-proxy behavior is documented in the official [reverse_proxy reference](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy).
 
@@ -96,5 +97,7 @@ Re-running the simulator is deterministic and updates its known synthetic IDs, b
 Before an update, export batch evidence and take a Neon restore point/branch. Deploy only a reviewed commit, rebuild, apply migrations, and restart. If application behavior regresses, restore the previous commit/image; never reverse a database migration without a tested corrective migration or database restore.
 
 On application startup, RecoveryOS scans durable pending action intents. An unclaimed intent is restored to BullMQ with its persisted execution time. An intent found in progress is treated as execution-unknown and routed to provider reconciliation rather than submitted again.
+
+The Redis container uses append-only persistence on the `redis_data` Docker volume, a bounded 128 MB memory limit, and `noeviction`, which BullMQ requires to prevent queue keys from being removed. Completed jobs are retained for at most seven days/1,000 entries and failed jobs for at most 30 days/1,000 entries; PostgreSQL remains the durable financial and audit system of record.
 
 When retiring the demo, stop the Compose stack, archive required audit evidence, remove secrets from the host, terminate the EC2 instance, and release the Elastic IP if it is no longer required.

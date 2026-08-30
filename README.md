@@ -50,7 +50,7 @@ The dashboard stores a supplied token in browser session storage only. Keep toke
 
 ## External setup checkpoints
 
-- **Now:** PostgreSQL and Redis are required to run the complete app. Docker Compose is optional; hosted TLS connections work for Windows development without WSL.
+- **Now:** PostgreSQL and Redis are required to run the complete app. Docker Compose is optional for Windows development, where hosted TLS connections work without WSL. Production Compose runs a private persistent Redis service on EC2 so an always-on BullMQ worker does not consume a serverless command quota.
 - **AI integration:** `AI_API_KEY` is optional. Without it, the deterministic simulator classifier is used. Groq GPT-OSS 120B is the example hosted provider; other OpenAI-compatible endpoints remain configurable through environment variables.
 - **Razorpay integration:** test credentials and a webhook secret are needed for sandbox webhook/API testing. Real execution remains fail-closed.
 - **Deployment:** an AWS account and EC2/Elastic IP are not needed until P7 deployment hardening.

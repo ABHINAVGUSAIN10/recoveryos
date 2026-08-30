@@ -160,6 +160,53 @@ describe('RecoveryService durable ingestion and execution recovery', () => {
   });
 });
 
+describe('RecoveryService live demonstration', () => {
+  const originalDemo = process.env.ENABLE_LIVE_DEMO;
+  const originalSimulation = process.env.SIMULATION_MODE;
+  const originalDelay = process.env.DEMO_RETRY_DELAY_SECONDS;
+
+  afterEach(() => {
+    if (originalDemo === undefined) delete process.env.ENABLE_LIVE_DEMO; else process.env.ENABLE_LIVE_DEMO = originalDemo;
+    if (originalSimulation === undefined) delete process.env.SIMULATION_MODE; else process.env.SIMULATION_MODE = originalSimulation;
+    if (originalDelay === undefined) delete process.env.DEMO_RETRY_DELAY_SECONDS; else process.env.DEMO_RETRY_DELAY_SECONDS = originalDelay;
+    jest.restoreAllMocks();
+  });
+
+  it('refuses to create demo incidents unless the explicit simulation guard is enabled', async () => {
+    process.env.ENABLE_LIVE_DEMO = 'false';
+    process.env.SIMULATION_MODE = 'true';
+    const service = new RecoveryService({} as never, { status: jest.fn().mockReturnValue({ configured: true }) } as never, {} as never, {} as never);
+
+    await expect(service.runLiveDemo('TRANSIENT_LOW_VALUE')).rejects.toThrow('disabled');
+  });
+
+  it('creates a unique live-AI incident, verifies replay deduplication, and groups evidence', async () => {
+    process.env.ENABLE_LIVE_DEMO = 'true';
+    process.env.SIMULATION_MODE = 'true';
+    process.env.DEMO_RETRY_DELAY_SECONDS = '5';
+    const service = new RecoveryService({} as never, { status: jest.fn().mockReturnValue({ configured: true }) } as never, {} as never, {} as never);
+    const ingest = jest.spyOn(service, 'ingestWebhook')
+      .mockResolvedValueOnce({ duplicate: false, incidentId: 'incident-1' })
+      .mockResolvedValueOnce({ duplicate: true, incidentId: 'incident-1' });
+    jest.spyOn(service, 'createBatch').mockResolvedValue({ id: 'batch-1', name: 'Live AI Demo' } as never);
+    jest.spyOn(service, 'incidentDetail').mockResolvedValue({ id: 'incident-1', status: IncidentStatus.AUTO_RETRY } as never);
+
+    const result = await service.runLiveDemo('TRANSIENT_LOW_VALUE', 'token:operator');
+
+    expect(result).toMatchObject({
+      scenario: 'TRANSIENT_LOW_VALUE', retryDelaySeconds: 5,
+      duplicateReplayVerified: { TRANSIENT_LOW_VALUE: true },
+      batch: { id: 'batch-1' }, incidents: [{ id: 'incident-1' }],
+    });
+    expect(result.runId).toMatch(/^demo_/);
+    expect(ingest).toHaveBeenCalledTimes(2);
+    expect(ingest.mock.calls[0][2]).toMatchObject({ payload: { payout: { entity: {
+      amount: 500_000, status: 'failed', notes: { recoveryos_demo_scenario: 'TRANSIENT_LOW_VALUE' },
+    } } } });
+    expect(ingest.mock.calls[0][3]).toMatchObject({ actorId: 'token:operator', retryDelaySeconds: 5 });
+  });
+});
+
 describe('RecoveryService batch reporting', () => {
   const batch = {
     id: 'batch-1', name: 'Regression cohort', cohortSize: 2, totalValueAtRiskPaise: 30000,

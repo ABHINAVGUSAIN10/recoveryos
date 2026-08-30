@@ -7,6 +7,8 @@ const environmentSchema = z.object({
   REDIS_URL: z.string().min(1).refine(value => /^rediss?:\/\//.test(value), 'must be a Redis URL'),
   LOG_REQUESTS: z.enum(['true', 'false']).default('true'),
   SIMULATION_MODE: z.enum(['true', 'false']).default('true'),
+  ENABLE_LIVE_DEMO: z.enum(['true', 'false']).default('false'),
+  DEMO_RETRY_DELAY_SECONDS: z.string().regex(/^\d+$/, 'must be seconds').default('5'),
   AUTH_MODE: z.enum(['disabled', 'token']).default('disabled'),
   ALLOWED_ORIGINS: z.string().default('http://localhost:3000'),
   RAZORPAY_WEBHOOK_SECRET: z.string().optional(),
@@ -31,6 +33,7 @@ export function validateEnvironment(values: Record<string, unknown>) {
   const production = env.NODE_ENV === 'production';
   const tokenAuth = env.AUTH_MODE === 'token';
   const liveExecution = env.SIMULATION_MODE === 'false';
+  const liveDemo = env.ENABLE_LIVE_DEMO === 'true';
 
   if (production && !tokenAuth) errors.push('AUTH_MODE must be token when NODE_ENV is production');
   if (production && (!env.ALLOWED_ORIGINS || env.ALLOWED_ORIGINS.includes('*'))) errors.push('ALLOWED_ORIGINS must explicitly list trusted origins in production');
@@ -47,6 +50,10 @@ export function validateEnvironment(values: Record<string, unknown>) {
     if (!env.RAZORPAY_KEY_SECRET || /replace|example/i.test(env.RAZORPAY_KEY_SECRET)) errors.push('RAZORPAY_KEY_SECRET is required when simulation mode is disabled');
     if (!tokenAuth) errors.push('AUTH_MODE must be token when simulation mode is disabled');
   }
+
+  const demoDelaySeconds = Number.parseInt(env.DEMO_RETRY_DELAY_SECONDS, 10);
+  if (liveDemo && liveExecution) errors.push('ENABLE_LIVE_DEMO requires SIMULATION_MODE=true');
+  if (demoDelaySeconds < 1 || demoDelaySeconds > 60) errors.push('DEMO_RETRY_DELAY_SECONDS must be between 1 and 60');
 
   if (errors.length) throw new Error(`Unsafe environment configuration: ${errors.join('; ')}`);
   return env;

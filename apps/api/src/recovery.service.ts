@@ -1,20 +1,23 @@
-import { Injectable, Logger, type OnApplicationBootstrap } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException, Injectable, Logger, ServiceUnavailableException, type OnApplicationBootstrap } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
-import { createHash } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import { Decision, ExecutionOutcome, IncidentStatus, Prisma, ReviewStatus } from '@prisma/client';
 import { aiProposalSchema, evaluatePolicy, incidentSchema, policyConfigSchema, type Incident, type PolicyConfig } from '@recoveryos/domain';
 import { PrismaService } from './prisma.service';
 import { AiService } from './ai.service';
 import { incidentIdFromRecoveryReference, RazorpayExecutionUncertainError, RazorpayService, recoveryIdempotencyKey } from './razorpay.service';
 import { safeErrorMessage } from './redaction';
+import { DEMO_SCENARIOS, demoScenarioSchema } from './demo-scenarios';
 
 const DEFAULT_POLICY: PolicyConfig = { version: 'v1.0.0', maxAutoRetryAttempts: 2, maxAutonomousAmountPaise: 1_000_000, minimumRetryDelayMinutes: 30 };
 type BatchWithIncidents = Prisma.BatchRunGetPayload<{ include: { results: { include: { incident: { include: { analyses: { orderBy: { createdAt: 'desc' }, take: 1 }, policyDecisions: { orderBy: { createdAt: 'desc' }, take: 1 } } } } } } }>;
 type IncidentListQuery = { page?: number; pageSize?: number; search?: string; status?: string; reviewRequired?: boolean };
+type DemoAnalysisContext = { runId: string; actorId: string; retryDelaySeconds: number };
 @Injectable()
 export class RecoveryService implements OnApplicationBootstrap {
   private readonly logger = new Logger(RecoveryService.name);
+  private demoRunActive = false;
   constructor(private readonly prisma: PrismaService, private readonly ai: AiService, private readonly razorpay: RazorpayService, @InjectQueue('recovery') private readonly queue: Queue) {}
   async onApplicationBootstrap() {
     try {
@@ -36,10 +39,68 @@ export class RecoveryService implements OnApplicationBootstrap {
       try { queue = { ...emptyCounts, ...(await this.withTimeout(this.queue.getJobCounts('waiting', 'active', 'delayed', 'completed', 'failed', 'paused'), 5_000)) }; }
       catch { services.redis = false; }
     }
+    const ai = this.ai.status();
+    const demoEnabled = process.env.ENABLE_LIVE_DEMO === 'true';
+    const simulationMode = process.env.SIMULATION_MODE !== 'false';
     return {
       status: services.database && services.redis ? 'ready' : 'degraded',
-      simulationMode: process.env.SIMULATION_MODE !== 'false', services, queue, ai: this.ai.status(), timestamp: new Date().toISOString(),
+      simulationMode, services, queue, ai,
+      demo: {
+        enabled: demoEnabled,
+        ready: demoEnabled && simulationMode && services.database && services.redis && ai.configured,
+        retryDelaySeconds: Number.parseInt(process.env.DEMO_RETRY_DELAY_SECONDS || '5', 10),
+        scenarios: DEMO_SCENARIOS.map(({ key, title, description, amountPaise, expectedAiAction, expectedPolicyDecision, humanRequired }) => ({ key, title, description, amountPaise, expectedAiAction, expectedPolicyDecision, humanRequired })),
+      },
+      timestamp: new Date().toISOString(),
     };
+  }
+
+  async runLiveDemo(scenarioInput: string, actorId = 'operator') {
+    if (process.env.ENABLE_LIVE_DEMO !== 'true') throw new ForbiddenException('Live demonstration mode is disabled');
+    if (process.env.SIMULATION_MODE === 'false') throw new ForbiddenException('Live demonstrations require simulation mode');
+    if (!this.ai.status().configured) throw new ServiceUnavailableException('A hosted AI provider must be configured for the live demonstration');
+    const parsed = demoScenarioSchema.safeParse(scenarioInput);
+    if (!parsed.success) throw new BadRequestException('Unknown live demonstration scenario');
+    if (this.demoRunActive) throw new ConflictException('Another live demonstration is already running');
+
+    const selected = parsed.data === 'ALL' ? DEMO_SCENARIOS : DEMO_SCENARIOS.filter(item => item.key === parsed.data);
+    const runId = `demo_${Date.now().toString(36)}_${randomBytes(3).toString('hex')}`;
+    const retryDelaySeconds = Number.parseInt(process.env.DEMO_RETRY_DELAY_SECONDS || '5', 10);
+    const incidentIds: string[] = [];
+    const duplicateReplayVerified: Record<string, boolean> = {};
+    this.demoRunActive = true;
+    try {
+      for (const scenario of selected) {
+        const eventId = `evt_${runId}_${scenario.key.toLowerCase()}`;
+        const eventType = scenario.providerStatus === 'processing' ? 'payout.initiated' : 'payout.failed';
+        const payoutId = `pout_${runId}_${scenario.key.toLowerCase()}`;
+        const payload = {
+          event_id: eventId,
+          event: eventType,
+          payload: { payout: { entity: {
+            id: payoutId,
+            amount: scenario.amountPaise,
+            currency: 'INR',
+            status: scenario.providerStatus,
+            reference_id: `recoveryos-${runId}`,
+            status_details: { description: scenario.reason },
+            notes: { recoveryos_demo_run: runId, recoveryos_demo_scenario: scenario.key },
+          } } },
+        };
+        const context: DemoAnalysisContext = { runId, actorId, retryDelaySeconds };
+        const first = await this.ingestWebhook(eventId, eventType, payload, context);
+        const replay = await this.ingestWebhook(eventId, eventType, payload);
+        if (!first.incidentId) throw new Error(`Demo scenario ${scenario.key} did not create an incident`);
+        incidentIds.push(first.incidentId);
+        duplicateReplayVerified[scenario.key] = replay.duplicate && replay.incidentId === first.incidentId;
+      }
+
+      const batch = await this.createBatch(`Live AI Demo ${runId}`, incidentIds);
+      const incidents = await Promise.all(incidentIds.map(id => this.incidentDetail(id)));
+      return { runId, scenario: parsed.data, retryDelaySeconds, duplicateReplayVerified, batch, incidents };
+    } finally {
+      this.demoRunActive = false;
+    }
   }
   async recoverPendingExecutions() {
     const executions = await this.prisma.actionExecution.findMany({ where: { outcome: ExecutionOutcome.PENDING }, include: { incident: true } });
@@ -72,7 +133,7 @@ export class RecoveryService implements OnApplicationBootstrap {
     await this.prisma.$transaction(async db => { await db.policyConfig.updateMany({ where: { active: true }, data: { active: false } }); await db.policyConfig.upsert({ where: { version: parsed.version }, update: { rulesJson: parsed, active: true, createdBy: actorId }, create: { version: parsed.version, rulesJson: parsed, createdBy: actorId } }); });
     return parsed;
   }
-  async ingestWebhook(externalEventId: string, eventType: string, payload: any) {
+  async ingestWebhook(externalEventId: string, eventType: string, payload: any, demoContext?: DemoAnalysisContext) {
     const existing = await this.prisma.payoutEvent.findUnique({ where: { externalEventId } });
     if (existing) return { duplicate: true, incidentId: existing.payoutIncidentId };
     const entity = payload?.payload?.payout?.entity ?? payload?.payout ?? payload;
@@ -112,6 +173,7 @@ export class RecoveryService implements OnApplicationBootstrap {
         }
         const event = await db.payoutEvent.create({ data: { externalEventId, eventType, payloadJson: payload, payoutIncidentId: incident.id } });
         await this.audit(db, incident.id, 'WEBHOOK_RECEIVED', 'SYSTEM', `Provider event ${eventType} persisted`, { externalEventId, eventId: event.id });
+        if (demoContext) await this.audit(db, incident.id, 'DEMO_SCENARIO_STARTED', 'HUMAN', `Live demonstration ${demoContext.runId} started by ${demoContext.actorId}`, { runId: demoContext.runId }, undefined, undefined, demoContext.actorId);
         return { incident, linkedRecovery };
       });
     } catch (error) {
@@ -121,10 +183,10 @@ export class RecoveryService implements OnApplicationBootstrap {
       }
       throw error;
     }
-    if (result.incident.status !== IncidentStatus.RECOVERED && !(result.linkedRecovery && result.incident.status === IncidentStatus.PROCESSING)) await this.analyze(result.incident.id);
+    if (result.incident.status !== IncidentStatus.RECOVERED && !(result.linkedRecovery && result.incident.status === IncidentStatus.PROCESSING)) await this.analyze(result.incident.id, demoContext);
     return { duplicate: false, incidentId: result.incident.id };
   }
-  async analyze(incidentId: string) {
+  async analyze(incidentId: string, demoContext?: DemoAnalysisContext) {
     const record = await this.prisma.payoutIncident.findUniqueOrThrow({ where: { id: incidentId } });
     const incident = incidentSchema.parse({ id: record.id, razorpayPayoutId: record.razorpayPayoutId, status: record.status, amountPaise: record.amountPaise, currency: record.currency, reason: record.currentReason, beneficiaryRef: record.beneficiaryRef, attempts: record.attempts, duplicateSuspected: record.duplicateSuspected, policyVersion: (await this.getPolicy()).version });
     const [analysis, config] = await Promise.all([this.ai.classify(incident), this.getPolicy()]);
@@ -139,16 +201,19 @@ export class RecoveryService implements OnApplicationBootstrap {
       await this.audit(db, incidentId, 'POLICY_DECISION', 'POLICY', result.reasons.join('; '), { proposal, result }, config.version, result.decision);
       if (result.decision === 'ESCALATE' || result.decision === 'APPROVAL_REQUIRED') await db.reviewTask.create({ data: { incidentId, severity: incident.amountPaise > config.maxAutonomousAmountPaise ? 'HIGH' : 'MEDIUM' } });
     });
-    if (result.decision === 'AUTO_RETRY') await this.scheduleRetry(incidentId, result.delayMinutes ?? config.minimumRetryDelayMinutes);
+    if (result.decision === 'AUTO_RETRY') await this.scheduleRetry(incidentId, result.delayMinutes ?? config.minimumRetryDelayMinutes, demoContext);
     return result;
   }
-  private async scheduleRetry(incidentId: string, delayMinutes: number) {
+  private async scheduleRetry(incidentId: string, delayMinutes: number, demoContext?: DemoAnalysisContext) {
     const incident = await this.prisma.payoutIncident.findUniqueOrThrow({ where: { id: incidentId } });
     const key = recoveryIdempotencyKey(incident.id, incident.attempts + 1);
-    const scheduledFor = new Date(Date.now() + delayMinutes * 60_000);
+    const scheduledFor = new Date(Date.now() + (demoContext ? demoContext.retryDelaySeconds * 1_000 : delayMinutes * 60_000));
     const execution = await this.prisma.actionExecution.upsert({ where: { idempotencyKey: key }, update: {}, create: { incidentId, actionType: 'RETRY_PAYOUT', idempotencyKey: key, requestHash: createHash('sha256').update(`${incident.razorpayPayoutId}:${key}`).digest('hex'), scheduledFor } });
     await this.enqueueExecution(execution.id, execution.scheduledFor);
-    await this.prisma.auditEvent.create({ data: { incidentId, eventType: 'ACTION_REQUESTED', actorType: 'SYSTEM', rationale: `Retry scheduled in ${delayMinutes} minutes`, dataJson: { executionId: execution.id, idempotencyKey: key } } });
+    const rationale = demoContext
+      ? `Policy delay ${delayMinutes} minutes compressed to ${demoContext.retryDelaySeconds} seconds for simulation demo ${demoContext.runId}`
+      : `Retry scheduled in ${delayMinutes} minutes`;
+    await this.prisma.auditEvent.create({ data: { incidentId, eventType: 'ACTION_REQUESTED', actorType: 'SYSTEM', rationale, dataJson: { executionId: execution.id, idempotencyKey: key, policyDelayMinutes: delayMinutes, effectiveDelaySeconds: demoContext?.retryDelaySeconds, demoRunId: demoContext?.runId } } });
   }
   private async enqueueExecution(executionId: string, scheduledFor: Date) {
     const delay = Math.max(0, scheduledFor.getTime() - Date.now());

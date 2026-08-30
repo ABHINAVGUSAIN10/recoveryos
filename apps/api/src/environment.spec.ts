@@ -45,4 +45,23 @@ describe('validateEnvironment', () => {
       ADMIN_API_TOKEN: 'a'.repeat(32),
     })).toMatchObject({ NODE_ENV: 'production', SIMULATION_MODE: 'true' });
   });
+
+  it('rejects live demo controls when financial execution is enabled', () => {
+    expect(() => validateEnvironment({
+      ...base,
+      SIMULATION_MODE: 'false',
+      ENABLE_LIVE_DEMO: 'true',
+      AUTH_MODE: 'token',
+      VIEWER_API_TOKEN: 'v'.repeat(32),
+      OPERATOR_API_TOKEN: 'o'.repeat(32),
+      ADMIN_API_TOKEN: 'a'.repeat(32),
+      RAZORPAY_KEY_ID: 'rzp_test_safe',
+      RAZORPAY_KEY_SECRET: 's'.repeat(32),
+    })).toThrow('ENABLE_LIVE_DEMO requires SIMULATION_MODE=true');
+  });
+
+  it('rejects an unsafe demonstration retry delay', () => {
+    expect(() => validateEnvironment({ ...base, DEMO_RETRY_DELAY_SECONDS: '0' }))
+      .toThrow('DEMO_RETRY_DELAY_SECONDS must be between 1 and 60');
+  });
 });

@@ -80,4 +80,10 @@ Run the six-case smoke evaluation with `pnpm ai:evaluate -- --require-live`. Run
 4. If Razorpay execution is uncertain, leave the incident `EXECUTION_UNKNOWN` and run authenticated reconciliation. Never create a fresh-key payout to test the connection. Reconciliation fetches a known recovery payout or repeats the identical create request with its original idempotency key.
 5. Correlate proxy and API logs using `x-request-id`, then record any manual decision in the incident audit trail.
 
+## Live demo controls
+
+`POST /api/v1/demo-runs` requires an operator role, `ENABLE_LIVE_DEMO=true`, `SIMULATION_MODE=true`, a configured hosted AI provider, PostgreSQL, and Redis. The API accepts only the fixed scenario allowlist and permits one run at a time per API process. It generates all payout and event identifiers server-side, never accepts fund-account details, never invokes live Razorpay execution, and verifies an immediate duplicate replay against the event ledger.
+
+Disable `ENABLE_LIVE_DEMO` after the presentation if interactive scenario generation is no longer required. Existing demo incidents, analyses, decisions, actions, batches, and audit events remain available as evidence.
+
 CI additionally validates the production Compose and Caddy configurations and builds both runtime images on Ubuntu. Local Windows development does not need Docker; the deployment-package job provides the Linux/container gate once the repository is pushed.

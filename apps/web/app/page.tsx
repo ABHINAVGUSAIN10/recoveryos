@@ -2,13 +2,15 @@
 import { useEffect, useMemo, useState } from 'react';
 
 type Incident = { id: string; razorpayPayoutId: string; status: string; amountPaise: number; currentReason?: string; attempts: number; reviewTasks: unknown[]; policyDecisions?: { finalDecision: string }[]; updatedAt: string };
-type Detail = Omit<Incident, 'policyDecisions'> & { auditEvents: { id: string; eventType: string; actorType: string; rationale: string; createdAt: string; decision?: string }[]; analyses: { modelRef: string; promptVersion: string; createdAt: string; outputJson: { category: string; confidence: number; evidenceSummary: string; recommendedAction: string } }[]; policyDecisions: { finalDecision: string; reasonsJson: string[] }[] };
+type Detail = Omit<Incident, 'policyDecisions'> & { auditEvents: { id: string; eventType: string; actorType: string; rationale: string; createdAt: string; decision?: string }[]; analyses: { modelRef: string; promptVersion: string; createdAt: string; outputJson: { category: string; confidence: number; evidenceSummary: string; recommendedAction: string } }[]; policyDecisions: { finalDecision: string; reasonsJson: string[] }[]; executions?: { id: string; outcome: string; scheduledFor: string; createdAt: string }[] };
 type Metrics = { valueAtRiskPaise: number; recoveredValuePaise: number; recoveryRate: number; eligibleCount: number; eligibleValuePaise: number; recoveredEligibleValuePaise: number; eligibleRecoveryRate: number; pendingRecoveryValuePaise: number; manualReviewValuePaise: number; protectedValuePaise: number; manualInterventions: number; unsafeActionsPrevented: number; unresolvedIncidents: number; statusDistribution: Record<string, number> };
 type Batch = { id: string; name: string; cohortSize: number; startedAt: string; metrics: Metrics };
 type Policy = { version: string; maxAutoRetryAttempts: number; maxAutonomousAmountPaise: number; minimumRetryDelayMinutes: number };
-type Operations = { status: 'ready' | 'degraded'; simulationMode: boolean; services: { database: boolean; redis: boolean }; queue: { waiting: number; active: number; delayed: number; completed: number; failed: number; paused: number }; ai: { mode: string; configured: boolean; provider: string; model: string; thinkingMode: string; promptVersion: string }; timestamp: string };
+type DemoScenario = { key: string; title: string; description: string; amountPaise: number; expectedAiAction: string; expectedPolicyDecision: string; humanRequired: boolean };
+type Operations = { status: 'ready' | 'degraded'; simulationMode: boolean; services: { database: boolean; redis: boolean }; queue: { waiting: number; active: number; delayed: number; completed: number; failed: number; paused: number }; ai: { mode: string; configured: boolean; provider: string; model: string; thinkingMode: string; promptVersion: string }; demo: { enabled: boolean; ready: boolean; retryDelaySeconds: number; scenarios: DemoScenario[] }; timestamp: string };
 type IncidentPage = { total: number; page: number; pageSize: number; totalPages: number };
-type View = 'incidents' | 'batches' | 'policy' | 'operations';
+type DemoRun = { runId: string; scenario: string; retryDelaySeconds: number; duplicateReplayVerified: Record<string, boolean>; batch: Batch; incidents: Detail[] };
+type View = 'incidents' | 'batches' | 'demo' | 'policy' | 'operations';
 
 const api = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001/api/v1';
 const money = (paise: number) => new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR' }).format(paise / 100);
@@ -22,6 +24,9 @@ export default function Dashboard() {
   const [selectedBatch, setSelectedBatch] = useState<Batch | null>(null);
   const [policy, setPolicy] = useState<Policy | null>(null);
   const [operations, setOperations] = useState<Operations | null>(null);
+  const [demoRun, setDemoRun] = useState<DemoRun | null>(null);
+  const [demoBusy, setDemoBusy] = useState(false);
+  const [demoError, setDemoError] = useState('');
   const [incidentPage, setIncidentPage] = useState<IncidentPage>({ total: 0, page: 1, pageSize: 20, totalPages: 1 });
   const [search, setSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState('');
@@ -57,7 +62,36 @@ export default function Dashboard() {
   const connect = async () => { sessionStorage.setItem('recoveryos-token', tokenInput); setAuthToken(tokenInput); await load(tokenInput); };
   const disconnect = async () => { sessionStorage.removeItem('recoveryos-token'); setAuthToken(''); setTokenInput(''); await load(''); };
   const downloadBatch = async (batch: Batch, format: 'csv' | 'json') => { const response = await apiFetch(`/batches/${batch.id}/export.${format}`); if (!response.ok) { setNotice('Authentication is required to download evidence.'); return; } const blob = await response.blob(); const url = URL.createObjectURL(blob); const anchor = document.createElement('a'); anchor.href = url; anchor.download = `${batch.name.replaceAll(/[^a-z0-9]+/gi, '-').toLowerCase()}.${format}`; anchor.click(); URL.revokeObjectURL(url); };
+  const runDemo = async (scenario: string) => {
+    setDemoBusy(true); setDemoError('');
+    try {
+      const response = await apiFetch('/demo-runs', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ scenario }) });
+      const body = await response.json();
+      if (!response.ok) throw new Error(Array.isArray(body.message) ? body.message.join(' ') : body.message || 'Live demonstration failed');
+      setDemoRun(body); setSelectedBatch(body.batch); setNotice(`Started ${body.batch.name}`);
+      await load();
+    } catch (error) { setDemoError(error instanceof Error ? error.message : 'Live demonstration failed'); }
+    finally { setDemoBusy(false); }
+  };
+  const openDemoIncident = async (incident: Detail) => {
+    const runSearch = demoRun?.runId || incident.razorpayPayoutId;
+    setSearch(runSearch); setStatusFilter(''); setReviewOnly(false); setView('incidents'); setDetail(incident);
+    await load(authToken, 1, { search: runSearch, statusFilter: '', reviewOnly: false });
+  };
   useEffect(() => { const stored = sessionStorage.getItem('recoveryos-token') || ''; setAuthToken(stored); setTokenInput(stored); load(stored); }, []);
+  useEffect(() => {
+    if (view !== 'demo' || !demoRun || !demoRun.incidents.some(incident => ['AUTO_RETRY', 'EXECUTING'].includes(incident.status))) return;
+    const timer = window.setInterval(async () => {
+      try {
+        const refreshed = await Promise.all(demoRun.incidents.map(async incident => { const response = await apiFetch(`/incidents/${incident.id}`); return response.ok ? response.json() : incident; }));
+        const batchResponse = await apiFetch(`/batches/${demoRun.batch.id}`);
+        const batch = batchResponse.ok ? await batchResponse.json() : demoRun.batch;
+        setDemoRun(current => current?.runId === demoRun.runId ? { ...current, incidents: refreshed, batch } : current);
+        setSelectedBatch(current => current?.id === batch.id ? batch : current);
+      } catch {}
+    }, 1_500);
+    return () => window.clearInterval(timer);
+  }, [view, demoRun?.runId, demoRun?.incidents.map(incident => incident.status).join('|')]);
 
   const liveMetrics = useMemo<Metrics>(() => {
     const atRisk = incidents.reduce((sum, incident) => sum + incident.amountPaise, 0);
@@ -85,13 +119,14 @@ export default function Dashboard() {
 
   return <main>
     <header><div><p className="eyebrow">RAZORPAY RECOVERYOS</p><h1>Recovery command center</h1><p className="subtle">AI advises. Policy authorizes. Every decision is auditable.</p></div><div className="simulation">● SIMULATION / TEST MODE</div></header>
-    <nav className="nav"><button className={view === 'incidents' ? 'active' : ''} onClick={() => setView('incidents')}>Incidents</button><button className={view === 'batches' ? 'active' : ''} onClick={() => setView('batches')}>Batch evidence</button><button className={view === 'policy' ? 'active' : ''} onClick={() => setView('policy')}>Policy controls</button><button className={view === 'operations' ? 'active' : ''} onClick={() => setView('operations')}>Operations</button><span>{selectedBatch ? `Metrics: ${selectedBatch.name}` : 'Live incident metrics'}</span>{authToken && <button onClick={disconnect}>Sign out</button>}</nav>
+    <nav className="nav"><button className={view === 'incidents' ? 'active' : ''} onClick={() => setView('incidents')}>Incidents</button><button className={view === 'batches' ? 'active' : ''} onClick={() => setView('batches')}>Batch evidence</button><button className={view === 'demo' ? 'active' : ''} onClick={() => setView('demo')}>Live demo</button><button className={view === 'policy' ? 'active' : ''} onClick={() => setView('policy')}>Policy controls</button><button className={view === 'operations' ? 'active' : ''} onClick={() => setView('operations')}>Operations</button><span>{selectedBatch ? `Metrics: ${selectedBatch.name}` : 'Live incident metrics'}</span>{authToken && <button onClick={disconnect}>Sign out</button>}</nav>
     <section className="metrics"><Metric label="Value at risk" value={money(metrics.valueAtRiskPaise)} /><Metric label="Gross recovered" value={money(metrics.recoveredValuePaise)} accent="green" /><Metric label="Gross recovery" value={`${(metrics.recoveryRate * 100).toFixed(1)}%`} /><Metric label="Eligible recovery" value={`${(metrics.eligibleRecoveryRate * 100).toFixed(1)}%`} accent="green" /><Metric label="Eligible value" value={money(metrics.eligibleValuePaise)} /><Metric label="Pending recovery" value={money(metrics.pendingRecoveryValuePaise)} /><Metric label="Protected value" value={money(metrics.protectedValuePaise)} accent="orange" /><Metric label="Manual review value" value={money(metrics.manualReviewValuePaise)} /></section>
     {notice && <div className="notice">{notice}<button onClick={() => setNotice('')}>Dismiss</button></div>}
     {error === 'AUTH_REQUIRED' && <section className="panel auth-panel"><p className="eyebrow">AUTHENTICATION REQUIRED</p><h2>Connect to RecoveryOS</h2><p>Enter a viewer, operator, or administrator token. It is kept only in this browser tab.</p><div><input type="password" value={tokenInput} onChange={event => setTokenInput(event.target.value)} placeholder="Bearer token" /><button className="approve" onClick={connect}>Connect</button></div></section>}
     {error && error !== 'AUTH_REQUIRED' && <div className="empty panel">{error}</div>}
     {!error && view === 'incidents' && <section className="content"><div className="panel list"><div className="panel-head"><div><h2>Incident queue</h2><p>{loading ? 'Loading…' : `${incidentPage.total} payout incidents · page ${incidentPage.page} of ${incidentPage.totalPages}`}</p></div><button onClick={() => load()}>Refresh</button></div><div className="filters"><input value={search} onChange={event => setSearch(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') load(authToken, 1); }} placeholder="Search payout ID or reason" aria-label="Search incidents" /><select value={statusFilter} onChange={event => setStatusFilter(event.target.value)} aria-label="Filter by status"><option value="">All statuses</option>{['RECOVERED', 'AUTO_RETRY', 'ESCALATE', 'APPROVAL_REQUIRED', 'PROCESSING', 'STOPPED', 'EXECUTION_UNKNOWN', 'FAILED'].map(status => <option key={status} value={status}>{status.replaceAll('_', ' ')}</option>)}</select><label><input type="checkbox" checked={reviewOnly} onChange={event => setReviewOnly(event.target.checked)} />Open reviews</label><button onClick={() => load(authToken, 1)}>Apply</button><button onClick={() => { const cleared = { search: '', statusFilter: '', reviewOnly: false }; setSearch(''); setStatusFilter(''); setReviewOnly(false); load(authToken, 1, cleared); }}>Clear</button></div><div className="rows">{incidents.map(incident => <button className="row" key={incident.id} onClick={() => open(incident.id)}><span><strong>{incident.razorpayPayoutId}</strong><small>{incident.currentReason || 'No reason supplied'}</small></span><span className={`badge ${tone(incident.status)}`}>{incident.status.replaceAll('_', ' ')}</span><strong>{money(incident.amountPaise)}</strong></button>)}{!loading && !incidents.length && <div className="empty">No incidents match these filters.</div>}</div><div className="pagination"><button disabled={incidentPage.page <= 1} onClick={() => load(authToken, incidentPage.page - 1)}>Previous</button><span>Showing {incidents.length} of {incidentPage.total}</span><button disabled={incidentPage.page >= incidentPage.totalPages} onClick={() => load(authToken, incidentPage.page + 1)}>Next</button></div></div><aside className="panel detail">{detail ? <IncidentDetail detail={detail} onReview={review} /> : <div className="empty"><h2>Select an incident</h2><p>Inspect AI evidence, policy decisions, actions, and the complete audit timeline.</p></div>}</aside></section>}
     {!error && view === 'batches' && <BatchWorkspace batches={batches} selected={selectedBatch} onSelect={setSelectedBatch} onCreate={createBatch} onDownload={downloadBatch} />}
+    {!error && view === 'demo' && <DemoWorkspace operations={operations} run={demoRun} busy={demoBusy} error={demoError} onRun={runDemo} onOpenIncident={openDemoIncident} onOpenBatch={batch => { setSelectedBatch(batch); setView('batches'); }} />}
     {!error && view === 'policy' && policy && <PolicyWorkspace policy={policy} onChange={setPolicy} onSave={savePolicy} />}
     {!error && view === 'operations' && <OperationsWorkspace operations={operations} onRefresh={() => load()} />}
   </main>;
@@ -100,6 +135,43 @@ export default function Dashboard() {
 function Metric({ label, value, accent }: { label: string; value: string; accent?: string }) { return <article className={`metric ${accent || ''}`}><span>{label}</span><strong>{value}</strong></article>; }
 function BatchWorkspace({ batches, selected, onSelect, onCreate, onDownload }: { batches: Batch[]; selected: Batch | null; onSelect: (batch: Batch) => void; onCreate: () => void; onDownload: (batch: Batch, format: 'csv' | 'json') => void }) {
   return <section className="workspace"><div className="panel batch-list"><div className="panel-head"><div><h2>Evaluation batches</h2><p>Reproducible financial evidence</p></div><button onClick={onCreate}>Create from queue</button></div>{batches.length ? batches.map(batch => <button key={batch.id} className={`batch-card ${selected?.id === batch.id ? 'selected' : ''}`} onClick={() => onSelect(batch)}><span><strong>{batch.name}</strong><small>{new Date(batch.startedAt).toLocaleString()} · {batch.cohortSize} cases</small></span><strong>Eligible {(batch.metrics.eligibleRecoveryRate * 100).toFixed(1)}%</strong></button>) : <div className="empty">No batches yet. Create one from the current incident queue.</div>}</div><aside className="panel batch-detail">{selected ? <><div className="panel-head"><div><p className="eyebrow">BATCH EVIDENCE</p><h2>{selected.name}</h2></div><span className="badge neutral">{selected.cohortSize} CASES</span></div><div className="batch-stats expanded"><span>Gross recovered<strong>{money(selected.metrics.recoveredValuePaise)}</strong></span><span>Eligible recovered<strong>{money(selected.metrics.recoveredEligibleValuePaise)}</strong></span><span>Eligible recovery<strong>{(selected.metrics.eligibleRecoveryRate * 100).toFixed(1)}%</strong></span><span>Pending recovery<strong>{money(selected.metrics.pendingRecoveryValuePaise)}</strong></span><span>Protected value<strong>{money(selected.metrics.protectedValuePaise)}</strong></span><span>Manual review value<strong>{money(selected.metrics.manualReviewValuePaise)}</strong></span></div><div className="metric-note">Eligible recovery measures only policy-approved transient failures. Gross recovery includes payouts that arrived already processed.</div><div className="distribution"><p className="eyebrow">OUTCOME DISTRIBUTION</p>{Object.entries(selected.metrics.statusDistribution).map(([status, count]) => <div key={status}><span>{status.replaceAll('_', ' ')}</span><strong>{count}</strong></div>)}</div><div className="actions"><button className="approve" onClick={() => onDownload(selected, 'csv')}>Download CSV</button><button onClick={() => onDownload(selected, 'json')}>Download JSON</button></div></> : <div className="empty">Select a batch to inspect its evidence.</div>}</aside></section>;
+}
+function DemoWorkspace({ operations, run, busy, error, onRun, onOpenIncident, onOpenBatch }: { operations: Operations | null; run: DemoRun | null; busy: boolean; error: string; onRun: (scenario: string) => void; onOpenIncident: (incident: Detail) => void; onOpenBatch: (batch: Batch) => void }) {
+  const demo = operations?.demo;
+  const preflight = [
+    ['Simulation safety', Boolean(operations?.simulationMode), 'ENABLED'],
+    ['Groq hosted model', Boolean(operations?.ai.configured), operations?.ai.model || 'UNAVAILABLE'],
+    ['PostgreSQL', Boolean(operations?.services.database), 'READY'],
+    ['Redis / BullMQ', Boolean(operations?.services.redis), 'READY'],
+  ] as const;
+  return <section className="demo-workspace">
+    <div className="panel demo-control">
+      <div className="panel-head"><div><p className="eyebrow">PRESENTER CONSOLE</p><h2>Live AI decision demonstration</h2><p>Every run creates normal incidents, policy evidence, queue actions, and an auditable batch.</p></div><span className={`badge ${demo?.ready ? 'good' : 'warn'}`}>{demo?.ready ? 'READY' : 'NOT READY'}</span></div>
+      <div className="demo-preflight">{preflight.map(([label, ready, detail]) => <article key={label}><span>{label}</span><strong className={ready ? 'state-good' : 'state-warn'}>● {ready ? detail : 'UNAVAILABLE'}</strong></article>)}</div>
+      {!demo?.enabled && <div className="demo-warning">Live demo controls are disabled on the API. Set <code>ENABLE_LIVE_DEMO=true</code> only while simulation mode is enabled.</div>}
+      <div className="demo-scenarios">{demo?.scenarios.map(scenario => <article key={scenario.key} className="demo-scenario"><div><p className="eyebrow">{scenario.humanRequired ? 'HUMAN GATE' : 'AUTONOMOUS PATH'}</p><h3>{scenario.title}</h3><p>{scenario.description}</p></div><dl><div><dt>Amount</dt><dd>{money(scenario.amountPaise)}</dd></div><div><dt>Expected AI</dt><dd>{scenario.expectedAiAction}</dd></div><div><dt>Expected policy</dt><dd>{scenario.expectedPolicyDecision.replaceAll('_', ' ')}</dd></div></dl><button disabled={!demo.ready || busy} onClick={() => onRun(scenario.key)}>{busy ? 'Running…' : 'Run scenario'}</button></article>)}</div>
+      <div className="demo-run-all"><button className="approve" disabled={!demo?.ready || busy} onClick={() => onRun('ALL')}>{busy ? 'Calling Groq and evaluating policy…' : 'Run all four scenarios'}</button><span>Autonomous retries use transparent simulation time compression: policy delay → {demo?.retryDelaySeconds ?? 5} seconds.</span></div>
+      {error && <div className="demo-error">{error}</div>}
+    </div>
+    <div className="panel demo-output">
+      {!run ? <div className="empty"><h2>No live run yet</h2><p>Select a scenario to watch the actual AI, policy, queue, and audit outputs appear here.</p></div> : <>
+        <div className="panel-head"><div><p className="eyebrow">LIVE RUN {run.runId}</p><h2>{run.batch.name}</h2><p>{run.incidents.length} persisted incident{run.incidents.length === 1 ? '' : 's'} · duplicate replay verified</p></div><button onClick={() => onOpenBatch(run.batch)}>Open batch</button></div>
+        <div className="demo-results">{run.incidents.map(incident => {
+          const analysis = incident.analyses.at(-1);
+          const proposal = analysis?.outputJson;
+          const decision = incident.policyDecisions.at(-1);
+          const scenarioKey = incident.razorpayPayoutId.split(`${run.runId}_`)[1]?.toUpperCase() || '';
+          const duplicateSafe = run.duplicateReplayVerified[scenarioKey];
+          return <article className="demo-result" key={incident.id}>
+            <div className="demo-result-head"><div><p className="eyebrow">{scenarioKey.replaceAll('_', ' ')}</p><h3>{incident.razorpayPayoutId}</h3></div><span className={`badge ${tone(incident.status)}`}>{incident.status.replaceAll('_', ' ')}</span></div>
+            <div className="demo-decision-grid"><section><span>AI advisory</span><strong>{proposal ? `${proposal.category.replaceAll('_', ' ')} → ${proposal.recommendedAction}` : 'Pending'}</strong><small>{analysis?.modelRef || 'Waiting for hosted model'}</small></section><section><span>Policy decision</span><strong>{decision?.finalDecision.replaceAll('_', ' ') || 'Pending'}</strong><small>{decision?.reasonsJson.join(' ') || 'Waiting for deterministic policy'}</small></section><section><span>Safety evidence</span><strong>{duplicateSafe ? 'DUPLICATE BLOCKED' : 'VERIFYING'}</strong><small>{incident.executions?.length || 0} durable action record(s)</small></section></div>
+            <div className="demo-timeline"><p className="eyebrow">ACTUAL AUDIT EVENTS</p>{incident.auditEvents.map(event => <div key={event.id}><i></i><span><strong>{event.eventType.replaceAll('_', ' ')}</strong><small>{event.rationale}</small></span></div>)}</div>
+            <button onClick={() => onOpenIncident(incident)}>Open full incident</button>
+          </article>;
+        })}</div>
+      </>}
+    </div>
+  </section>;
 }
 function PolicyWorkspace({ policy, onChange, onSave }: { policy: Policy; onChange: (policy: Policy) => void; onSave: () => void }) { const numeric = (key: keyof Policy, value: string) => onChange({ ...policy, [key]: Number(value) }); return <section className="panel policy-workspace"><div className="panel-head"><div><h2>Deterministic recovery policy</h2><p>Activating a version changes authorization rules, never AI behavior.</p></div><span className="badge neutral">FAIL CLOSED</span></div><div className="policy-form"><label>Policy version<input value={policy.version} onChange={event => onChange({ ...policy, version: event.target.value })} /></label><label>Maximum automatic retries<input type="number" min="0" max="10" value={policy.maxAutoRetryAttempts} onChange={event => numeric('maxAutoRetryAttempts', event.target.value)} /></label><label>Autonomous amount limit (paise)<input type="number" min="1" value={policy.maxAutonomousAmountPaise} onChange={event => numeric('maxAutonomousAmountPaise', event.target.value)} /></label><label>Minimum retry delay (minutes)<input type="number" min="0" value={policy.minimumRetryDelayMinutes} onChange={event => numeric('minimumRetryDelayMinutes', event.target.value)} /></label><div className="policy-warning"><strong>Activation is immediate.</strong><p>Create a new version identifier for every material rule change. Existing audit events retain the policy version that authorized them.</p></div><button className="approve" onClick={onSave}>Activate policy version</button></div></section>; }
 function OperationsWorkspace({ operations, onRefresh }: { operations: Operations | null; onRefresh: () => void }) {

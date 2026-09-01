@@ -40,7 +40,15 @@ Be precise during the presentation: the initial temporary failure is a controlle
 
 For an ambiguous or timed-out execution, call `POST /api/v1/reconcile`. RecoveryOS queries the provider and records a terminal outcome when one is confirmed; it never creates another payout while the provider remains uncertain.
 
-Batch metrics are derived from the current incident outcomes rather than the original batch snapshots. This ensures a retry that later succeeds is reflected in recovered value while preserving the original cohort and value-at-risk denominator.
+New batch metrics are immutable snapshots. Outcomes, intervention counts, safety decisions, policy/model/prompt versions, and cohort fingerprints are frozen when the batch completes. A retry that succeeds later belongs in a new outcome snapshot; it cannot rewrite prior evidence.
+
+## Inbound revenue recovery demonstration
+
+Set `ENABLE_REVENUE_DEMO=true`, keep simulation enabled, and configure the hosted model. After signing in, open **Revenue recovery** and click **Run inbound revenue experiment**.
+
+The fixed eight-case cohort covers transient gateway failure, issuer soft decline, insufficient funds, high value, customer authentication, expired payment method, processing ambiguity, and fraud review. For every case, the model must cite persisted event IDs and propose a maximum three-step playbook. Deterministic policy authorizes only a bounded first action and blocks invented evidence, duplicate risk, consent violations, excessive attempts, and compliance signals.
+
+The controlled worker creates a simulated `payment.captured` event only for scenarios whose outcome was declared `CAPTURED` in the fixed library before execution. Revenue is attributed only from that capture event. The resulting immutable experiment compares no action, a conservative rules-only baseline, and AI plus policy. The dashboard labels these as synthetic controlled outcomes; do not present them as production causal lift.
 
 For a webhook demonstration, HMAC-SHA256-sign the exact JSON request body with `RAZORPAY_WEBHOOK_SECRET`, POST it to `/api/v1/webhooks/razorpay`, and then resend the event to demonstrate idempotency.
 

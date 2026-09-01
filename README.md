@@ -1,6 +1,6 @@
 # RecoveryOS
 
-Simulator-first recovery control plane for payout incidents. AI can classify and recommend; deterministic policy authorizes; execution is disabled by default unless explicitly configured.
+Simulator-first AI revenue-recovery control plane with two deliberately separate domains: inbound failed-payment recovery and RazorpayX payout safety. AI diagnoses and proposes a bounded playbook; deterministic policy authorizes; execution is disabled by default unless explicitly configured.
 
 ## Local setup
 
@@ -26,6 +26,7 @@ Upstash supports BullMQ over its Redis protocol. BullMQ polls Redis while idle, 
 
 ## Operator workflow
 
+- **Revenue recovery** runs or inspects the fixed inbound-payment cohort, timeline-cited AI playbooks, deterministic authorization, captured-payment attribution, and immutable no-action/rules-only/AI-policy comparison.
 - **Incidents** shows the recovery queue, AI evidence, deterministic decisions, review controls, and the append-only audit timeline.
 - **Batch evidence** creates or opens evaluation cohorts, recomputes metrics from current incident outcomes, and exports traceable CSV or JSON evidence.
 - **Policy controls** activates a versioned retry limit, autonomous amount cap, and minimum delay. Use a new version identifier for each material change.
@@ -33,7 +34,7 @@ Upstash supports BullMQ over its Redis protocol. BullMQ polls Redis while idle, 
 - **Live demo** creates one or four uniquely identified synthetic incidents through the real AI, policy, durable-action, BullMQ, batch, and audit pipeline. It is disabled by default and can run only while simulation mode is enabled.
 - **RazorpayX Test Mode demo** is a separately guarded presenter action. It seeds a controlled temporary-failure incident, runs the same hosted-AI and deterministic-policy path, and—only when policy authorizes—creates one fixed ₹10,000 payout against a dedicated dummy Test Mode fund account.
 
-Batch reporting separates gross recovery from policy-eligible recovery. The SRD recovery target is evaluated using `recovered eligible value / eligible value`; already-processed payouts are included in gross recovery but excluded from that eligible denominator. Pending recovery, protected, and manual-review values are also reported in integer paise.
+Payout batch reporting separates gross recovery from policy-eligible recovery. New batches are immutable: result states, financial calculations, intervention counts, model/prompt/policy versions, and cohort fingerprints are frozen at completion. Inbound revenue experiments separately compare no action, conservative rules, and AI plus policy; recovered revenue requires a linked captured-payment event.
 
 Batch evidence endpoints are `GET /api/v1/batches`, `GET /api/v1/batches/:id`, and the `.csv` / `.json` export variants under `/api/v1/batches/:id/export`.
 Operational endpoints are public `GET /api/v1/ready` for a minimal readiness result and authenticated `GET /api/v1/operations` for service, queue, simulation, and advisory metadata. Neither endpoint returns credentials or connection details.
@@ -72,3 +73,8 @@ The hardened hosted-demo procedure is documented in [docs/deployment.md](docs/de
 - `processing`, unknown, duplicate-suspected, and exhausted incidents cannot be auto-retried.
 - A Razorpay timeout becomes `EXECUTION_UNKNOWN`; reconciliation must occur before any new payout request.
 - Set `SIMULATION_MODE=false` only after credentials, allowlisting, roles, and an explicit production review are in place.
+- Payout escalation cannot be directly approved for retry. Remediation must be recorded and a different actor must approve the newly created retry task.
+- Inbound AI evidence must cite persisted event IDs. Invented evidence, duplicate risk, absent consent, compliance signals, excessive attempts, and low confidence fail closed.
+- PostgreSQL triggers reject updates and deletes to raw event ledgers, audit events, and immutable experiment results.
+
+The inbound revenue design and controlled-experiment limitations are documented in [docs/revenue-recovery.md](docs/revenue-recovery.md).

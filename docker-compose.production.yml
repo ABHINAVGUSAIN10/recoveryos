@@ -40,6 +40,7 @@ services:
       # Production BullMQ runs on the private Compose network. This intentionally
       # overrides any legacy hosted REDIS_URL that may remain in env_file.
       REDIS_URL: redis://redis:6379
+    command: ["sh", "-c", "pnpm prisma:migrate:deploy && node dist/main.js"]
     depends_on:
       redis:
         condition: service_healthy

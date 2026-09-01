@@ -8,12 +8,12 @@ describe('provider rate-limit helpers', () => {
   });
 
   it('honors numeric Retry-After and caps excessive provider delays', () => {
-    expect(rateLimitRetryDelayMs({ status: 429, headers: { 'retry-after': '1.5' } })).toBe(1_500);
+    expect(rateLimitRetryDelayMs({ status: 429, headers: { 'retry-after': '1.5' } })).toBe(2_250);
     expect(rateLimitRetryDelayMs({ status: 429, headers: { 'retry-after': '120' } })).toBe(30_000);
     expect(rateLimitRetryDelayMs({ status: 500 })).toBe(0);
   });
 
   it('uses a bounded fallback when a 429 omits Retry-After', () => {
-    expect(rateLimitRetryDelayMs({ status: 429, headers: {} })).toBe(2_000);
+    expect(rateLimitRetryDelayMs({ status: 429, headers: {} })).toBe(2_750);
   });
 });

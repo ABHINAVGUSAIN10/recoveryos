@@ -5,11 +5,14 @@
 - `GET /health` proves that the API process is serving requests.
 - `GET /api/v1/ready` checks PostgreSQL and Redis without returning connection information.
 - Authenticated `GET /api/v1/operations` adds BullMQ counts, simulation state, and the advisory provider/model/prompt identifiers used for audit evidence.
+- Authenticated `GET /api/v1/revenue/operations` reports the inbound recovery guard, policy, hosted-model requirement, and fixed scenario catalogue.
 - The dashboard **Operations** tab renders these same values; `ready` requires both PostgreSQL and Redis.
 
 ## Structured logs
 
 Every completed API request emits a structured JSON payload containing `event`, `requestId`, `method`, `path`, `statusCode`, `durationMs`, `actorRole`, and `simulationMode`. The API accepts a safe `x-request-id` value or generates a UUID and echoes it in the response. It never logs the query string, request body, authorization header, database URL, Redis URL, or model/provider credentials. Provider failures pass through the shared redactor, and Razorpay response bodies are not copied into thrown errors.
+
+The payout event ledger, payout audit log, inbound revenue event ledger, inbound audit log, payout batch results, and revenue experiment results have database triggers that reject updates and deletes. Treat schema-owner access as a break-glass privilege and monitor migration activity separately.
 
 Production Compose rotates API, web, and proxy logs at five 10 MB files per container. Caddy access logs use JSON on standard output. Inspect the current deployment with:
 

@@ -1,4 +1,4 @@
-import { ExecutionOutcome, IncidentStatus } from '@prisma/client';
+import { ExecutionOutcome, IncidentStatus, ReviewKind, ReviewStatus } from '@prisma/client';
 import { RecoveryService } from './recovery.service';
 import { recoveryReferenceId } from './razorpay.service';
 
@@ -229,28 +229,31 @@ describe('RecoveryService live demonstration', () => {
 describe('RecoveryService batch reporting', () => {
   const batch = {
     id: 'batch-1', name: 'Regression cohort', cohortSize: 2, totalValueAtRiskPaise: 30000,
-    startedAt: new Date('2026-08-21T10:00:00.000Z'), completedAt: null,
+    policyVersion: 'v1.0.0', modelRef: 'groq:test', promptVersion: 'classifier-v7', cohortFingerprint: 'frozen-fingerprint', baselineJson: { noAction: { recoveredValuePaise: 0 } },
+    metricsJson: { valueAtRiskPaise: 30000, recoveredValuePaise: 0, recoveryRate: 0, eligibleCount: 1, eligibleValuePaise: 10000, recoveredEligibleValuePaise: 0, eligibleRecoveryRate: 0, pendingRecoveryValuePaise: 10000, manualReviewValuePaise: 0, protectedValuePaise: 20000, manualInterventions: 0, unsafeActionsPrevented: 1, unresolvedIncidents: 2, statusDistribution: { AUTO_RETRY: 1, PROCESSING: 1 } },
+    startedAt: new Date('2026-08-21T10:00:00.000Z'), completedAt: new Date('2026-08-21T10:00:01.000Z'),
     results: [
-      { id: 'result-1', batchRunId: 'batch-1', incidentId: 'incident-1', finalState: 'AUTO_RETRY', recoveredValuePaise: 0, incident: { id: 'incident-1', razorpayPayoutId: 'pout_1', status: IncidentStatus.RECOVERED, amountPaise: 10000, currency: 'INR', currentReason: 'temporary bank issue', beneficiaryRef: null, attempts: 1, duplicateSuspected: false, createdAt: new Date(), updatedAt: new Date('2026-08-21T10:10:00.000Z'), analyses: [{ outputJson: { category: 'TRANSIENT_TECHNICAL', confidence: .9, evidenceSummary: 'Temporary issue', recommendedAction: 'RETRY', proposedDelayMinutes: 30 } }], policyDecisions: [{ finalDecision: 'AUTO_RETRY' }] } },
-      { id: 'result-2', batchRunId: 'batch-1', incidentId: 'incident-2', finalState: 'PROCESSING', recoveredValuePaise: 0, incident: { id: 'incident-2', razorpayPayoutId: 'pout_2', status: IncidentStatus.PROCESSING, amountPaise: 20000, currency: 'INR', currentReason: 'pending, bank confirmation', beneficiaryRef: null, attempts: 0, duplicateSuspected: false, createdAt: new Date(), updatedAt: new Date('2026-08-21T10:11:00.000Z'), analyses: [], policyDecisions: [{ finalDecision: 'STOPPED' }] } },
+      { id: 'result-1', batchRunId: 'batch-1', incidentId: 'incident-1', finalState: 'AUTO_RETRY', recoveredValuePaise: 0, eligibleForRecovery: true, humanInterventions: 0, unsafeActionsPrevented: 0, snapshotJson: { incident: { id: 'incident-1', razorpayPayoutId: 'pout_1', status: 'AUTO_RETRY', amountPaise: 10000, currency: 'INR', currentReason: 'temporary bank issue', beneficiaryRef: null, attempts: 0, duplicateSuspected: false, createdAt: '2026-08-21T10:00:00.000Z', updatedAt: '2026-08-21T10:00:00.000Z' } }, incident: { id: 'incident-1', razorpayPayoutId: 'pout_1', status: IncidentStatus.RECOVERED, amountPaise: 10000, currency: 'INR', currentReason: 'temporary bank issue', beneficiaryRef: null, attempts: 1, duplicateSuspected: false, createdAt: new Date(), updatedAt: new Date('2026-08-21T10:10:00.000Z') } },
+      { id: 'result-2', batchRunId: 'batch-1', incidentId: 'incident-2', finalState: 'PROCESSING', recoveredValuePaise: 0, eligibleForRecovery: false, humanInterventions: 0, unsafeActionsPrevented: 1, snapshotJson: { incident: { id: 'incident-2', razorpayPayoutId: 'pout_2', status: 'PROCESSING', amountPaise: 20000, currency: 'INR', currentReason: 'pending, bank confirmation', beneficiaryRef: null, attempts: 0, duplicateSuspected: false, createdAt: '2026-08-21T10:00:00.000Z', updatedAt: '2026-08-21T10:00:00.000Z' } }, incident: { id: 'incident-2', razorpayPayoutId: 'pout_2', status: IncidentStatus.PROCESSING, amountPaise: 20000, currency: 'INR', currentReason: 'pending, bank confirmation', beneficiaryRef: null, attempts: 0, duplicateSuspected: false, createdAt: new Date(), updatedAt: new Date('2026-08-21T10:11:00.000Z') } },
     ],
   };
   const service = new RecoveryService({ batchRun: { findUniqueOrThrow: jest.fn().mockResolvedValue(batch) } } as never, {} as never, {} as never, {} as never);
 
-  it('derives metrics from current incident outcomes rather than stale batch snapshots', async () => {
+  it('returns immutable metrics and incident snapshots even when the live incident later changes', async () => {
     const report = await service.batchResults('batch-1');
     expect(report.metrics).toMatchObject({
-      recoveredValuePaise: 10000, recoveryRate: 1 / 3, eligibleCount: 1, eligibleValuePaise: 10000,
-      recoveredEligibleValuePaise: 10000, eligibleRecoveryRate: 1, pendingRecoveryValuePaise: 0,
-      protectedValuePaise: 20000, unsafeActionsPrevented: 1, unresolvedIncidents: 1,
+      recoveredValuePaise: 0, recoveryRate: 0, eligibleCount: 1, eligibleValuePaise: 10000,
+      recoveredEligibleValuePaise: 0, eligibleRecoveryRate: 0, pendingRecoveryValuePaise: 10000,
+      protectedValuePaise: 20000, unsafeActionsPrevented: 1, unresolvedIncidents: 2,
     });
-    expect(report.results[0]).toMatchObject({ finalState: IncidentStatus.RECOVERED, recoveredValuePaise: 10000 });
+    expect(report).toMatchObject({ immutable: true });
+    expect(report.results[0]).toMatchObject({ finalState: IncidentStatus.AUTO_RETRY, recoveredValuePaise: 0, incident: { status: IncidentStatus.AUTO_RETRY, attempts: 0 } });
   });
 
   it('exports traceable CSV rows with escaped provider reasons', async () => {
     const csv = await service.batchExportCsv('batch-1');
     expect(csv).toContain('razorpay_payout_id');
-    expect(csv).toContain('pout_1,10000,INR,RECOVERED,10000');
+    expect(csv).toContain('pout_1,10000,INR,AUTO_RETRY,0');
     expect(csv).toContain('"pending, bank confirmation"');
   });
 });
@@ -298,5 +301,36 @@ describe('RecoveryService incident pagination', () => {
       skip: 10, take: 10,
       where: expect.objectContaining({ status: IncidentStatus.ESCALATE, reviewTasks: { some: { status: 'OPEN' } } }),
     }));
+  });
+});
+
+describe('RecoveryService remediation safety', () => {
+  it('never converts an escalation directly into a retry approval', async () => {
+    const prisma = { reviewTask: { findFirst: jest.fn().mockResolvedValue({ id: 'review-1', kind: ReviewKind.REMEDIATION, status: ReviewStatus.OPEN, remediationJson: null, incident: { id: 'incident-1', status: IncidentStatus.ESCALATE } }) } };
+    const service = new RecoveryService(prisma as never, {} as never, {} as never, {} as never);
+    await expect(service.decideReview('incident-1', true, 'token:operator')).rejects.toThrow('require recorded remediation');
+  });
+
+  it('enforces maker-checker separation after remediation', async () => {
+    const prisma = { reviewTask: { findFirst: jest.fn().mockResolvedValue({ id: 'review-2', kind: ReviewKind.RETRY_APPROVAL, status: ReviewStatus.OPEN, remediationJson: { remediatedBy: 'token:operator' }, incident: { id: 'incident-1', status: IncidentStatus.APPROVAL_REQUIRED } }) } };
+    const service = new RecoveryService(prisma as never, {} as never, {} as never, {} as never);
+    await expect(service.decideReview('incident-1', true, 'token:operator')).rejects.toThrow('different actor');
+  });
+
+  it('records remediation, revalidates policy, and opens a separate retry approval', async () => {
+    const transactionClient = {
+      reviewTask: { update: jest.fn(), create: jest.fn() }, payoutIncident: { update: jest.fn() },
+      policyDecision: { create: jest.fn() }, auditEvent: { create: jest.fn() },
+    };
+    const prisma = {
+      reviewTask: { findFirst: jest.fn().mockResolvedValue({ id: 'review-1', kind: ReviewKind.REMEDIATION, status: ReviewStatus.OPEN, incident: { id: 'incident-1', status: IncidentStatus.ESCALATE, beneficiaryRef: 'fa_old' } }) },
+      $transaction: jest.fn(async (callback: (client: typeof transactionClient) => Promise<void>) => callback(transactionClient)),
+    };
+    const service = new RecoveryService(prisma as never, {} as never, {} as never, {} as never);
+    jest.spyOn(service, 'getPolicy').mockResolvedValue({ version: 'v2', maxAutoRetryAttempts: 2, maxAutonomousAmountPaise: 1_000_000, minimumRetryDelayMinutes: 30 });
+    jest.spyOn(service, 'incidentDetail').mockResolvedValue({ id: 'incident-1', status: IncidentStatus.APPROVAL_REQUIRED } as never);
+    await service.remediateIncident('incident-1', { beneficiaryRef: 'fa_corrected', note: 'Validated replacement account from operations.' }, 'token:operator');
+    expect(transactionClient.reviewTask.create).toHaveBeenCalledWith({ data: expect.objectContaining({ kind: ReviewKind.RETRY_APPROVAL, remediationJson: expect.objectContaining({ remediatedBy: 'token:operator' }) }) });
+    expect(transactionClient.payoutIncident.update).toHaveBeenCalledWith(expect.objectContaining({ data: expect.objectContaining({ status: IncidentStatus.APPROVAL_REQUIRED, beneficiaryRef: 'fa_corrected' }) }));
   });
 });

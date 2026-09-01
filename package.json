@@ -14,7 +14,8 @@
     "acceptance:webhook": "pnpm --filter @recoveryos/api acceptance:webhook",
     "razorpay:readiness": "pnpm --filter @recoveryos/api razorpay:readiness",
     "razorpay:sandbox-exercise": "pnpm --filter @recoveryos/api razorpay:sandbox-exercise",
-    "ai:evaluate": "pnpm --filter @recoveryos/api ai:evaluate"
+    "ai:evaluate": "pnpm --filter @recoveryos/api ai:evaluate",
+    "ai:evaluate:revenue": "pnpm --filter @recoveryos/api ai:evaluate:revenue"
   },
   "devDependencies": {
     "typescript": "^5.7.3"

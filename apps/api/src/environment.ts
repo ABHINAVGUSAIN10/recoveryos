@@ -8,6 +8,7 @@ const environmentSchema = z.object({
   LOG_REQUESTS: z.enum(['true', 'false']).default('true'),
   SIMULATION_MODE: z.enum(['true', 'false']).default('true'),
   ENABLE_LIVE_DEMO: z.enum(['true', 'false']).default('false'),
+  ENABLE_REVENUE_DEMO: z.enum(['true', 'false']).default('false'),
   ENABLE_RAZORPAYX_TEST_DEMO: z.enum(['true', 'false']).default('false'),
   RAZORPAYX_TEST_DEMO_FUND_ACCOUNT_ID: z.string().optional(),
   RAZORPAYX_TEST_DEMO_COOLDOWN_SECONDS: z.string().regex(/^\d+$/, 'must be seconds').default('300'),
@@ -22,6 +23,7 @@ const environmentSchema = z.object({
   OPERATOR_API_TOKEN: z.string().optional(),
   ADMIN_API_TOKEN: z.string().optional(),
   AI_THINKING_MODE: z.enum(['enabled', 'disabled']).default('disabled'),
+  AI_REVENUE_REQUEST_INTERVAL_MS: z.string().regex(/^\d+$/, 'must be milliseconds').default('9000'),
 }).passthrough();
 
 export function validateEnvironment(values: Record<string, unknown>) {
@@ -37,6 +39,7 @@ export function validateEnvironment(values: Record<string, unknown>) {
   const tokenAuth = env.AUTH_MODE === 'token';
   const liveExecution = env.SIMULATION_MODE === 'false';
   const liveDemo = env.ENABLE_LIVE_DEMO === 'true';
+  const revenueDemo = env.ENABLE_REVENUE_DEMO === 'true';
   const razorpayTestDemo = env.ENABLE_RAZORPAYX_TEST_DEMO === 'true';
 
   if (production && !tokenAuth) errors.push('AUTH_MODE must be token when NODE_ENV is production');
@@ -57,7 +60,9 @@ export function validateEnvironment(values: Record<string, unknown>) {
 
   const demoDelaySeconds = Number.parseInt(env.DEMO_RETRY_DELAY_SECONDS, 10);
   const testDemoCooldownSeconds = Number.parseInt(env.RAZORPAYX_TEST_DEMO_COOLDOWN_SECONDS, 10);
+  const revenueRequestIntervalMs = Number.parseInt(env.AI_REVENUE_REQUEST_INTERVAL_MS, 10);
   if (liveDemo && liveExecution) errors.push('ENABLE_LIVE_DEMO requires SIMULATION_MODE=true');
+  if (revenueDemo && liveExecution) errors.push('ENABLE_REVENUE_DEMO requires SIMULATION_MODE=true');
   if (razorpayTestDemo) {
     if (liveExecution) errors.push('ENABLE_RAZORPAYX_TEST_DEMO requires SIMULATION_MODE=true');
     if (!tokenAuth) errors.push('ENABLE_RAZORPAYX_TEST_DEMO requires AUTH_MODE=token');
@@ -66,6 +71,7 @@ export function validateEnvironment(values: Record<string, unknown>) {
   }
   if (demoDelaySeconds < 1 || demoDelaySeconds > 60) errors.push('DEMO_RETRY_DELAY_SECONDS must be between 1 and 60');
   if (testDemoCooldownSeconds < 30 || testDemoCooldownSeconds > 3600) errors.push('RAZORPAYX_TEST_DEMO_COOLDOWN_SECONDS must be between 30 and 3600');
+  if (revenueRequestIntervalMs < 0 || revenueRequestIntervalMs > 60_000) errors.push('AI_REVENUE_REQUEST_INTERVAL_MS must be between 0 and 60000');
 
   if (errors.length) throw new Error(`Unsafe environment configuration: ${errors.join('; ')}`);
   return env;

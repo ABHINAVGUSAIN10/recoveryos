@@ -25,7 +25,9 @@
     "razorpay:sandbox-exercise": "ts-node src/razorpay-sandbox-exercise.ts --create-funded-test-payout",
     "razorpay:sandbox-exercise:prod": "node dist/razorpay-sandbox-exercise.js --create-funded-test-payout",
     "preai:evaluate": "pnpm --filter @recoveryos/domain build",
-    "ai:evaluate": "ts-node src/ai-evaluate.ts"
+    "ai:evaluate": "ts-node src/ai-evaluate.ts",
+    "preai:evaluate:revenue": "pnpm --filter @recoveryos/domain build",
+    "ai:evaluate:revenue": "ts-node src/revenue-ai-evaluate.ts"
   },
   "dependencies": {
     "@nestjs/bullmq": "^10.2.3",

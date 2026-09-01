@@ -11,9 +11,11 @@ import { RecoveryProcessor } from './recovery.processor';
 import { TokenAuthGuard } from './auth.guard';
 import { RequestLoggingMiddleware } from './request-logging.middleware';
 import { validateEnvironment } from './environment';
+import { RevenueRecoveryService } from './revenue-recovery.service';
+import { RevenueRecoveryProcessor } from './revenue-recovery.processor';
 @Module({
-  imports: [ConfigModule.forRoot({ isGlobal: true, envFilePath: ['.env', '../../.env'], validate: validateEnvironment }), BullModule.forRootAsync({ inject: [ConfigService], useFactory: (c: ConfigService) => ({ connection: { url: c.get<string>('REDIS_URL', 'redis://localhost:6379') } }) }), BullModule.registerQueue({ name: 'recovery' })],
-  controllers: [AppController], providers: [PrismaService, RecoveryService, AiService, RazorpayService, RecoveryProcessor, RequestLoggingMiddleware, { provide: APP_GUARD, useClass: TokenAuthGuard }],
+  imports: [ConfigModule.forRoot({ isGlobal: true, envFilePath: ['.env', '../../.env'], validate: validateEnvironment }), BullModule.forRootAsync({ inject: [ConfigService], useFactory: (c: ConfigService) => ({ connection: { url: c.get<string>('REDIS_URL', 'redis://localhost:6379') } }) }), BullModule.registerQueue({ name: 'recovery' }, { name: 'revenue-recovery' })],
+  controllers: [AppController], providers: [PrismaService, RecoveryService, RevenueRecoveryService, AiService, RazorpayService, RecoveryProcessor, RevenueRecoveryProcessor, RequestLoggingMiddleware, { provide: APP_GUARD, useClass: TokenAuthGuard }],
 }) export class AppModule implements NestModule {
   configure(consumer: MiddlewareConsumer) { consumer.apply(RequestLoggingMiddleware).forRoutes('*'); }
 }

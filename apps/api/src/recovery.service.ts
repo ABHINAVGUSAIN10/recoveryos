@@ -2,8 +2,8 @@ import { BadRequestException, ConflictException, ForbiddenException, Injectable,
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { createHash, randomBytes } from 'crypto';
-import { Decision, ExecutionOutcome, IncidentStatus, Prisma, ReviewStatus } from '@prisma/client';
-import { aiProposalSchema, evaluatePolicy, incidentSchema, policyConfigSchema, type Incident, type PolicyConfig } from '@recoveryos/domain';
+import { Decision, ExecutionOutcome, IncidentStatus, Prisma, ReviewKind, ReviewStatus } from '@prisma/client';
+import { aiProposalSchema, beneficiaryRemediationSchema, evaluatePolicy, incidentSchema, policyConfigSchema, type BeneficiaryRemediation, type Incident, type PolicyConfig } from '@recoveryos/domain';
 import { PrismaService } from './prisma.service';
 import { AiService } from './ai.service';
 import {
@@ -18,7 +18,7 @@ import { safeErrorMessage } from './redaction';
 import { DEMO_SCENARIOS, demoScenarioSchema } from './demo-scenarios';
 
 const DEFAULT_POLICY: PolicyConfig = { version: 'v1.0.0', maxAutoRetryAttempts: 2, maxAutonomousAmountPaise: 1_000_000, minimumRetryDelayMinutes: 30 };
-type BatchWithIncidents = Prisma.BatchRunGetPayload<{ include: { results: { include: { incident: { include: { analyses: { orderBy: { createdAt: 'desc' }, take: 1 }, policyDecisions: { orderBy: { createdAt: 'desc' }, take: 1 } } } } } } }>;
+type BatchWithIncidents = Prisma.BatchRunGetPayload<{ include: { results: { include: { incident: true } } } }>;
 type IncidentListQuery = { page?: number; pageSize?: number; search?: string; status?: string; reviewRequired?: boolean };
 type DemoAnalysisContext = { runId: string; actorId: string; retryDelaySeconds: number; executionMode?: 'SIMULATED' | 'RAZORPAYX_TEST' };
 @Injectable()
@@ -297,7 +297,11 @@ export class RecoveryService implements OnApplicationBootstrap {
       const status = record.status === IncidentStatus.PROCESSING ? IncidentStatus.PROCESSING : result.decision as IncidentStatus;
       await db.payoutIncident.update({ where: { id: incidentId }, data: { status } });
       await this.audit(db, incidentId, 'POLICY_DECISION', 'POLICY', result.reasons.join('; '), { proposal, result }, config.version, result.decision);
-      if (result.decision === 'ESCALATE' || result.decision === 'APPROVAL_REQUIRED') await db.reviewTask.create({ data: { incidentId, severity: incident.amountPaise > config.maxAutonomousAmountPaise ? 'HIGH' : 'MEDIUM' } });
+      if (result.decision === 'ESCALATE' || result.decision === 'APPROVAL_REQUIRED') await db.reviewTask.create({ data: {
+        incidentId,
+        kind: result.decision === 'ESCALATE' ? ReviewKind.REMEDIATION : ReviewKind.RETRY_APPROVAL,
+        severity: incident.amountPaise > config.maxAutonomousAmountPaise ? 'HIGH' : 'MEDIUM',
+      } });
     });
     if (result.decision === 'AUTO_RETRY') await this.scheduleRetry(incidentId, result.delayMinutes ?? config.minimumRetryDelayMinutes, demoContext);
     return result;
@@ -328,9 +332,62 @@ export class RecoveryService implements OnApplicationBootstrap {
     });
   }
   async decideReview(incidentId: string, approved: boolean, actorId = 'operator') {
-    const task = await this.prisma.reviewTask.findFirst({ where: { incidentId, status: ReviewStatus.OPEN }, orderBy: { createdAt: 'desc' } }); if (!task) throw new Error('No open review task');
-    await this.prisma.$transaction(async db => { await db.reviewTask.update({ where: { id: task.id }, data: { status: approved ? ReviewStatus.APPROVED : ReviewStatus.REJECTED, decision: approved ? 'APPROVE' : 'REJECT', decidedAt: new Date(), actorId } }); await db.payoutIncident.update({ where: { id: incidentId }, data: { status: approved ? IncidentStatus.AUTO_RETRY : IncidentStatus.STOPPED } }); await this.audit(db, incidentId, approved ? 'HUMAN_APPROVED' : 'HUMAN_REJECTED', 'HUMAN', `Review task ${approved ? 'approved' : 'rejected'} by ${actorId}`, { reviewTaskId: task.id }, undefined, approved ? 'AUTO_RETRY' : 'STOPPED', actorId); });
+    const task = await this.prisma.reviewTask.findFirst({ where: { incidentId, status: ReviewStatus.OPEN }, include: { incident: true }, orderBy: { createdAt: 'desc' } });
+    if (!task) throw new BadRequestException('No open review task');
+    if (approved && task.kind === ReviewKind.REMEDIATION) throw new ConflictException('Escalated incidents require recorded remediation and revalidation; they cannot be approved directly for retry');
+    if (approved && task.incident.status !== IncidentStatus.APPROVAL_REQUIRED) throw new ConflictException('Only an approval-required incident can be authorized for retry');
+    const remediation = task.remediationJson as { remediatedBy?: unknown } | null;
+    if (approved && typeof remediation?.remediatedBy === 'string' && remediation.remediatedBy === actorId) {
+      throw new ConflictException('Maker-checker control requires a different actor to approve the remediated retry');
+    }
+    await this.prisma.$transaction(async db => {
+      await db.reviewTask.update({ where: { id: task.id }, data: { status: approved ? ReviewStatus.APPROVED : ReviewStatus.REJECTED, decision: approved ? 'APPROVE_RETRY' : 'REJECT', decidedAt: new Date(), actorId } });
+      await db.payoutIncident.update({ where: { id: incidentId }, data: { status: approved ? IncidentStatus.AUTO_RETRY : IncidentStatus.STOPPED } });
+      await this.audit(db, incidentId, approved ? 'HUMAN_APPROVED_RETRY' : 'HUMAN_REJECTED', 'HUMAN', `Review task ${approved ? 'approved for retry' : 'rejected'} by ${actorId}`, { reviewTaskId: task.id, reviewKind: task.kind }, undefined, approved ? 'AUTO_RETRY' : 'STOPPED', actorId);
+    });
     if (approved) await this.scheduleRetry(incidentId, 0);
+  }
+  async remediateIncident(incidentId: string, input: BeneficiaryRemediation, actorId = 'operator') {
+    const remediation = beneficiaryRemediationSchema.parse(input);
+    const task = await this.prisma.reviewTask.findFirst({
+      where: { incidentId, status: ReviewStatus.OPEN, kind: ReviewKind.REMEDIATION },
+      include: { incident: true },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (!task) throw new BadRequestException('No open remediation task');
+    if (task.incident.status !== IncidentStatus.ESCALATE) throw new ConflictException('Only an escalated incident can be remediated');
+    if (task.incident.beneficiaryRef === remediation.beneficiaryRef) throw new BadRequestException('Remediation must provide a different beneficiary reference');
+    const policy = await this.getPolicy();
+    const beneficiaryRefHash = createHash('sha256').update(remediation.beneficiaryRef).digest('hex');
+    await this.prisma.$transaction(async db => {
+      await db.reviewTask.update({ where: { id: task.id }, data: {
+        status: ReviewStatus.APPROVED,
+        decision: 'REMEDIATED',
+        remediationJson: { beneficiaryRefHash, note: remediation.note },
+        decidedAt: new Date(),
+        actorId,
+      } });
+      await db.payoutIncident.update({ where: { id: incidentId }, data: {
+        status: IncidentStatus.APPROVAL_REQUIRED,
+        beneficiaryRef: remediation.beneficiaryRef,
+        currentReason: 'Beneficiary remediation recorded; a separate actor must approve the retry.',
+      } });
+      await db.policyDecision.create({ data: {
+        incidentId,
+        policyVersion: policy.version,
+        proposedAction: 'RETRY_AFTER_REMEDIATION',
+        finalDecision: Decision.APPROVAL_REQUIRED,
+        reasonsJson: ['POL-08: beneficiary remediation recorded', 'POL-09: maker-checker approval required before retry'],
+      } });
+      await db.reviewTask.create({ data: {
+        incidentId,
+        kind: ReviewKind.RETRY_APPROVAL,
+        severity: 'HIGH',
+        remediationJson: { remediatedBy: actorId, sourceTaskId: task.id, beneficiaryRefHash },
+      } });
+      await this.audit(db, incidentId, 'BENEFICIARY_REMEDIATED', 'HUMAN', 'Beneficiary remediation evidence recorded; retry remains blocked pending separate approval.', { sourceTaskId: task.id, beneficiaryRefHash, note: remediation.note }, policy.version, 'APPROVAL_REQUIRED', actorId);
+    });
+    return this.incidentDetail(incidentId);
   }
   async listIncidents(query: IncidentListQuery = {}) {
     const page = Math.max(1, Math.floor(query.page || 1));
@@ -404,19 +461,112 @@ export class RecoveryService implements OnApplicationBootstrap {
     }
     return { scanned: open.length, reconciled, pending, failures };
   }
-  async createBatch(name: string, incidentIds: string[]) { const incidents = await this.prisma.payoutIncident.findMany({ where: { id: { in: incidentIds } } }); const batch = await this.prisma.batchRun.create({ data: { name, cohortSize: incidents.length, totalValueAtRiskPaise: incidents.reduce((sum, item) => sum + item.amountPaise, 0) } }); await this.prisma.batchResult.createMany({ data: incidents.map(i => ({ batchRunId: batch.id, incidentId: i.id, finalState: i.status, recoveredValuePaise: i.status === IncidentStatus.RECOVERED ? i.amountPaise : 0 })) }); return this.batchResults(batch.id); }
+  async createBatch(name: string, incidentIds: string[]) {
+    const incidents = await this.prisma.payoutIncident.findMany({
+      where: { id: { in: incidentIds } },
+      include: {
+        events: { orderBy: { receivedAt: 'asc' } },
+        analyses: { orderBy: { createdAt: 'desc' }, take: 1 },
+        policyDecisions: { orderBy: { createdAt: 'desc' }, take: 1 },
+        auditEvents: { orderBy: { createdAt: 'asc' } },
+      },
+    });
+    const snapshots = incidents.map(incident => {
+      const analysis = incident.analyses[0];
+      const proposal = aiProposalSchema.safeParse(analysis?.outputJson);
+      const decision = incident.policyDecisions[0];
+      const eligibleForRecovery = proposal.success
+        ? proposal.data.category === 'TRANSIENT_TECHNICAL' && proposal.data.recommendedAction === 'RETRY'
+        : decision?.finalDecision === Decision.AUTO_RETRY;
+      const humanInterventions = incident.auditEvents.filter(event => ['HUMAN_APPROVED', 'HUMAN_APPROVED_RETRY', 'HUMAN_REJECTED', 'BENEFICIARY_REMEDIATED'].includes(event.eventType)).length;
+      const protectedStates: IncidentStatus[] = [IncidentStatus.STOPPED, IncidentStatus.PROCESSING, IncidentStatus.EXECUTION_UNKNOWN];
+      const protectedState = protectedStates.includes(incident.status);
+      const firstPayload = incident.events[0]?.payloadJson as { payload?: { payout?: { entity?: { status?: unknown } } } } | null;
+      const originalProviderStatus = String(firstPayload?.payload?.payout?.entity?.status ?? '').toUpperCase();
+      const snapshot = {
+        incident: {
+          id: incident.id, razorpayPayoutId: incident.razorpayPayoutId, status: incident.status,
+          amountPaise: incident.amountPaise, currency: incident.currency, currentReason: incident.currentReason,
+          beneficiaryRef: incident.beneficiaryRef, attempts: incident.attempts, duplicateSuspected: incident.duplicateSuspected,
+          createdAt: incident.createdAt.toISOString(), updatedAt: incident.updatedAt.toISOString(),
+        },
+        analysis: analysis ? { modelRef: analysis.modelRef, promptVersion: analysis.promptVersion, outputJson: analysis.outputJson, confidence: analysis.confidence } : null,
+        policyDecision: decision ? { policyVersion: decision.policyVersion, proposedAction: decision.proposedAction, finalDecision: decision.finalDecision, reasonsJson: decision.reasonsJson } : null,
+        originalProviderStatus,
+      };
+      return {
+        incidentId: incident.id,
+        finalState: incident.status,
+        recoveredValuePaise: incident.status === IncidentStatus.RECOVERED ? incident.amountPaise : 0,
+        eligibleForRecovery,
+        humanInterventions,
+        unsafeActionsPrevented: protectedState ? 1 : 0,
+        snapshot,
+      };
+    });
+    const totalValueAtRiskPaise = incidents.reduce((sum, item) => sum + item.amountPaise, 0);
+    const metrics = this.calculateBatchMetrics(snapshots, totalValueAtRiskPaise);
+    const policyVersions = [...new Set(snapshots.map(item => item.snapshot.policyDecision?.policyVersion).filter((value): value is string => Boolean(value)))];
+    const modelRefs = [...new Set(snapshots.map(item => item.snapshot.analysis?.modelRef).filter((value): value is string => Boolean(value)))];
+    const promptVersions = [...new Set(snapshots.map(item => item.snapshot.analysis?.promptVersion).filter((value): value is string => Boolean(value)))];
+    const ruleOnly = snapshots.filter(item => {
+      const reason = item.snapshot.incident.currentReason?.toLowerCase() ?? '';
+      return item.snapshot.originalProviderStatus === 'FAILED' && /technical|temporary|unavailable|network|connectivity|gateway|bank/.test(reason);
+    });
+    const baseline = {
+      methodology: {
+        noAction: 'Frozen cohort incidents already terminal-success at ingestion; no causal recovery is attributed.',
+        rulesOnly: 'Frozen keyword-rule eligibility with the observed terminal outcomes; reported separately from AI-policy eligibility.',
+      },
+      noAction: {
+        recoveredValuePaise: snapshots.filter(item => ['PROCESSED', 'SUCCESS', 'COMPLETED'].includes(item.snapshot.originalProviderStatus)).reduce((sum, item) => sum + item.snapshot.incident.amountPaise, 0),
+      },
+      rulesOnly: {
+        eligibleCount: ruleOnly.length,
+        eligibleValuePaise: ruleOnly.reduce((sum, item) => sum + item.snapshot.incident.amountPaise, 0),
+        observedRecoveredValuePaise: ruleOnly.reduce((sum, item) => sum + item.recoveredValuePaise, 0),
+      },
+    };
+    const cohortFingerprint = createHash('sha256').update(JSON.stringify(snapshots.map(item => item.snapshot).sort((a, b) => a.incident.id.localeCompare(b.incident.id)))).digest('hex');
+    const batch = await this.prisma.$transaction(async db => {
+      const created = await db.batchRun.create({ data: {
+        name,
+        cohortSize: incidents.length,
+        totalValueAtRiskPaise,
+        policyVersion: policyVersions.length === 1 ? policyVersions[0] : policyVersions.length ? 'mixed' : null,
+        modelRef: modelRefs.length === 1 ? modelRefs[0] : modelRefs.length ? 'mixed' : null,
+        promptVersion: promptVersions.length === 1 ? promptVersions[0] : promptVersions.length ? 'mixed' : null,
+        cohortFingerprint,
+        baselineJson: this.jsonValue(baseline),
+        metricsJson: this.jsonValue(metrics),
+        completedAt: new Date(),
+      } });
+      if (snapshots.length) await db.batchResult.createMany({ data: snapshots.map(item => ({
+        batchRunId: created.id,
+        incidentId: item.incidentId,
+        finalState: item.finalState,
+        recoveredValuePaise: item.recoveredValuePaise,
+        eligibleForRecovery: item.eligibleForRecovery,
+        humanInterventions: item.humanInterventions,
+        unsafeActionsPrevented: item.unsafeActionsPrevented,
+        snapshotJson: this.jsonValue(item.snapshot),
+      })) });
+      return created;
+    });
+    return this.batchResults(batch.id);
+  }
   async listBatches() {
-    const batches = await this.prisma.batchRun.findMany({ orderBy: { startedAt: 'desc' }, include: { results: { include: { incident: { include: { analyses: { orderBy: { createdAt: 'desc' }, take: 1 }, policyDecisions: { orderBy: { createdAt: 'desc' }, take: 1 } } } } } } });
+    const batches = await this.prisma.batchRun.findMany({ orderBy: { startedAt: 'desc' }, include: { results: { include: { incident: true } } } });
     return batches.map(batch => this.toBatchView(batch));
   }
   async batchResults(id: string) {
-    const batch = await this.prisma.batchRun.findUniqueOrThrow({ where: { id }, include: { results: { include: { incident: { include: { analyses: { orderBy: { createdAt: 'desc' }, take: 1 }, policyDecisions: { orderBy: { createdAt: 'desc' }, take: 1 } } } } } } });
+    const batch = await this.prisma.batchRun.findUniqueOrThrow({ where: { id }, include: { results: { include: { incident: true } } } });
     return this.toBatchView(batch);
   }
   async batchExportCsv(id: string) {
     const batch = await this.batchResults(id);
     const header = ['incident_id', 'razorpay_payout_id', 'amount_paise', 'currency', 'final_state', 'recovered_value_paise', 'attempts', 'reason', 'updated_at'];
-    const rows = batch.results.map(result => [result.incidentId, result.incident.razorpayPayoutId, result.incident.amountPaise, result.incident.currency, result.finalState, result.recoveredValuePaise, result.incident.attempts, result.incident.currentReason ?? '', result.incident.updatedAt.toISOString()]);
+    const rows = batch.results.map(result => [result.incidentId, result.incident.razorpayPayoutId, result.incident.amountPaise, result.incident.currency, result.finalState, result.recoveredValuePaise, result.incident.attempts, result.incident.currentReason ?? '', new Date(result.incident.updatedAt).toISOString()]);
     return [header, ...rows].map(row => row.map(value => this.csvValue(value)).join(',')).join('\n');
   }
   async recordExecutionResult(executionId: string, outcome: ExecutionOutcome, response: unknown) {
@@ -449,38 +599,53 @@ export class RecoveryService implements OnApplicationBootstrap {
   }
   private toBatchView(batch: BatchWithIncidents) {
     const results = batch.results.map(result => {
-      const finalState = result.incident.status;
-      const eligibleForRecovery = this.isEligibleForRecovery(result.incident);
-      return { ...result, finalState, eligibleForRecovery, recoveredValuePaise: finalState === IncidentStatus.RECOVERED ? result.incident.amountPaise : 0 };
+      const snapshot = result.snapshotJson as { incident?: Record<string, unknown> } | null;
+      return {
+        ...result,
+        finalState: result.finalState,
+        eligibleForRecovery: Boolean(result.eligibleForRecovery),
+        recoveredValuePaise: result.recoveredValuePaise,
+        humanInterventions: result.humanInterventions ?? 0,
+        unsafeActionsPrevented: result.unsafeActionsPrevented ?? 0,
+        incident: snapshot?.incident ? { ...result.incident, ...snapshot.incident } : result.incident,
+      };
     });
+    const storedMetrics = batch.metricsJson as ReturnType<RecoveryService['calculateBatchMetrics']> | null;
+    const metrics = storedMetrics ?? this.calculateBatchMetrics(results.map(result => ({
+      finalState: result.finalState,
+      recoveredValuePaise: result.recoveredValuePaise,
+      eligibleForRecovery: result.eligibleForRecovery,
+      humanInterventions: result.humanInterventions,
+      unsafeActionsPrevented: result.unsafeActionsPrevented,
+      snapshot: { incident: { amountPaise: result.incident.amountPaise } },
+    })), batch.totalValueAtRiskPaise);
+    return { ...batch, results, baseline: batch.baselineJson, metrics, immutable: Boolean(batch.completedAt && batch.metricsJson && batch.cohortFingerprint) };
+  }
+  private calculateBatchMetrics(results: Array<{ finalState: string; recoveredValuePaise: number; eligibleForRecovery: boolean; humanInterventions: number; unsafeActionsPrevented: number; snapshot: { incident: { amountPaise: number } } }>, valueAtRiskPaise: number) {
     const recoveredValuePaise = results.reduce((sum, result) => sum + result.recoveredValuePaise, 0);
     const eligible = results.filter(result => result.eligibleForRecovery);
-    const eligibleValuePaise = eligible.reduce((sum, result) => sum + result.incident.amountPaise, 0);
-    const recoveredEligibleValuePaise = eligible.filter(result => result.finalState === IncidentStatus.RECOVERED).reduce((sum, result) => sum + result.incident.amountPaise, 0);
+    const eligibleValuePaise = eligible.reduce((sum, result) => sum + result.snapshot.incident.amountPaise, 0);
+    const recoveredEligibleValuePaise = eligible.reduce((sum, result) => sum + result.recoveredValuePaise, 0);
     const statusDistribution = results.reduce<Record<string, number>>((counts, result) => { counts[result.finalState] = (counts[result.finalState] ?? 0) + 1; return counts; }, {});
-    const manualStates: IncidentStatus[] = [IncidentStatus.APPROVAL_REQUIRED, IncidentStatus.ESCALATE];
-    const protectedStates: IncidentStatus[] = [IncidentStatus.STOPPED, IncidentStatus.PROCESSING, IncidentStatus.EXECUTION_UNKNOWN];
-    const unresolvedStates: IncidentStatus[] = [IncidentStatus.RECEIVED, IncidentStatus.ANALYZING, IncidentStatus.POLICY_PENDING, IncidentStatus.AUTO_RETRY, IncidentStatus.APPROVAL_REQUIRED, IncidentStatus.EXECUTING, IncidentStatus.PROCESSING, IncidentStatus.ESCALATE, IncidentStatus.EXECUTION_UNKNOWN];
-    const manual = results.filter(result => manualStates.includes(result.finalState));
-    const protectedResults = results.filter(result => protectedStates.includes(result.finalState));
-    const pendingEligible = eligible.filter(result => result.finalState !== IncidentStatus.RECOVERED);
-    return { ...batch, results, metrics: {
-      valueAtRiskPaise: batch.totalValueAtRiskPaise, recoveredValuePaise,
-      recoveryRate: batch.totalValueAtRiskPaise ? recoveredValuePaise / batch.totalValueAtRiskPaise : 0,
-      eligibleCount: eligible.length, eligibleValuePaise, recoveredEligibleValuePaise,
+    const manualStates = ['APPROVAL_REQUIRED', 'ESCALATE'];
+    const protectedStates = ['STOPPED', 'PROCESSING', 'EXECUTION_UNKNOWN'];
+    const unresolvedStates = ['RECEIVED', 'ANALYZING', 'POLICY_PENDING', 'AUTO_RETRY', 'APPROVAL_REQUIRED', 'EXECUTING', 'PROCESSING', 'ESCALATE', 'EXECUTION_UNKNOWN'];
+    return {
+      valueAtRiskPaise,
+      recoveredValuePaise,
+      recoveryRate: valueAtRiskPaise ? recoveredValuePaise / valueAtRiskPaise : 0,
+      eligibleCount: eligible.length,
+      eligibleValuePaise,
+      recoveredEligibleValuePaise,
       eligibleRecoveryRate: eligibleValuePaise ? recoveredEligibleValuePaise / eligibleValuePaise : 0,
-      pendingRecoveryValuePaise: pendingEligible.reduce((sum, result) => sum + result.incident.amountPaise, 0),
-      manualReviewValuePaise: manual.reduce((sum, result) => sum + result.incident.amountPaise, 0),
-      protectedValuePaise: protectedResults.reduce((sum, result) => sum + result.incident.amountPaise, 0),
-      manualInterventions: manual.length, unsafeActionsPrevented: protectedResults.length,
-      unresolvedIncidents: results.filter(result => unresolvedStates.includes(result.finalState)).length, statusDistribution,
-    } };
-  }
-  private isEligibleForRecovery(incident: BatchWithIncidents['results'][number]['incident']) {
-    const analysis = incident.analyses[0]?.outputJson;
-    const parsed = aiProposalSchema.safeParse(analysis);
-    if (parsed.success) return parsed.data.category === 'TRANSIENT_TECHNICAL' && parsed.data.recommendedAction === 'RETRY';
-    return incident.policyDecisions[0]?.finalDecision === Decision.AUTO_RETRY;
+      pendingRecoveryValuePaise: eligible.filter(result => result.finalState !== 'RECOVERED').reduce((sum, result) => sum + result.snapshot.incident.amountPaise, 0),
+      manualReviewValuePaise: results.filter(result => manualStates.includes(result.finalState)).reduce((sum, result) => sum + result.snapshot.incident.amountPaise, 0),
+      protectedValuePaise: results.filter(result => protectedStates.includes(result.finalState)).reduce((sum, result) => sum + result.snapshot.incident.amountPaise, 0),
+      manualInterventions: results.reduce((sum, result) => sum + result.humanInterventions, 0),
+      unsafeActionsPrevented: results.reduce((sum, result) => sum + result.unsafeActionsPrevented, 0),
+      unresolvedIncidents: results.filter(result => unresolvedStates.includes(result.finalState)).length,
+      statusDistribution,
+    };
   }
   private async serviceStatus() {
     let database = false; let redis = false;

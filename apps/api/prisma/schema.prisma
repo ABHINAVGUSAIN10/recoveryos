@@ -38,10 +38,35 @@ enum ReviewStatus {
   REJECTED
 }
 
+enum ReviewKind {
+  RETRY_APPROVAL
+  REMEDIATION
+}
+
 enum ExecutionOutcome {
   PENDING
   SUCCEEDED
   FAILED
+  UNKNOWN
+}
+
+enum RevenueIncidentStatus {
+  DETECTED
+  ANALYZING
+  POLICY_PENDING
+  AUTO_ACTION
+  APPROVAL_REQUIRED
+  ESCALATED
+  STOPPED
+  RECOVERED
+  EXPIRED
+}
+
+enum RevenueActionOutcome {
+  PENDING
+  SUCCEEDED
+  FAILED
+  BLOCKED
   UNKNOWN
 }
 
@@ -116,9 +141,11 @@ model ReviewTask {
   id         String         @id @default(uuid())
   incidentId String
   incident   PayoutIncident @relation(fields: [incidentId], references: [id])
+  kind       ReviewKind     @default(RETRY_APPROVAL)
   severity   String
   status     ReviewStatus   @default(OPEN)
   decision   String?
+  remediationJson Json?
   decidedAt  DateTime?
   actorId    String?
   createdAt  DateTime       @default(now())
@@ -153,6 +180,12 @@ model BatchRun {
   name                  String
   cohortSize            Int
   totalValueAtRiskPaise Int           @default(0)
+  policyVersion         String?
+  modelRef              String?
+  promptVersion         String?
+  cohortFingerprint     String?
+  baselineJson          Json?
+  metricsJson           Json?
   startedAt             DateTime      @default(now())
   completedAt           DateTime?
   results               BatchResult[]
@@ -166,6 +199,131 @@ model BatchResult {
   incident            PayoutIncident @relation(fields: [incidentId], references: [id])
   finalState          String
   recoveredValuePaise Int            @default(0)
+  eligibleForRecovery Boolean         @default(false)
+  humanInterventions  Int             @default(0)
+  unsafeActionsPrevented Int          @default(0)
+  snapshotJson        Json?
+  recordedAt          DateTime        @default(now())
 
   @@unique([batchRunId, incidentId])
+}
+
+model RevenueIncident {
+  id                 String                @id @default(uuid())
+  sourcePaymentId    String                @unique
+  status             RevenueIncidentStatus
+  amountPaise        Int
+  currency           String                @default("INR")
+  customerRef        String
+  paymentMethod      String
+  failureCode        String
+  failureDescription String
+  consentToContact   Boolean               @default(false)
+  attemptCount       Int                   @default(0)
+  detectedAt         DateTime              @default(now())
+  recoveredAt        DateTime?
+  expiresAt          DateTime?
+  createdAt          DateTime              @default(now())
+  updatedAt          DateTime              @updatedAt
+  events             RevenueEvent[]
+  analyses           RevenueAnalysis[]
+  policyDecisions    RevenuePolicyDecision[]
+  actions            RevenueAction[]
+  auditEvents        RevenueAuditEvent[]
+  experimentResults  RevenueExperimentResult[]
+}
+
+model RevenueEvent {
+  id              String          @id @default(uuid())
+  externalEventId String          @unique
+  incidentId      String
+  incident        RevenueIncident @relation(fields: [incidentId], references: [id])
+  eventType       String
+  occurredAt      DateTime
+  dataJson        Json
+  createdAt       DateTime        @default(now())
+}
+
+model RevenueAnalysis {
+  id             String          @id @default(uuid())
+  incidentId     String
+  incident       RevenueIncident @relation(fields: [incidentId], references: [id])
+  modelRef       String
+  promptVersion  String
+  timelineDigest String
+  outputJson     Json
+  confidence     Float
+  createdAt      DateTime        @default(now())
+}
+
+model RevenuePolicyDecision {
+  id             String          @id @default(uuid())
+  incidentId     String
+  incident       RevenueIncident @relation(fields: [incidentId], references: [id])
+  policyVersion  String
+  proposedAction String
+  finalAction    String
+  authorized     Boolean
+  reasonsJson    Json
+  createdAt      DateTime        @default(now())
+}
+
+model RevenueAction {
+  id                     String               @id @default(uuid())
+  incidentId             String
+  incident               RevenueIncident      @relation(fields: [incidentId], references: [id])
+  actionType             String
+  idempotencyKey         String               @unique
+  outcome                RevenueActionOutcome @default(PENDING)
+  scheduledFor           DateTime
+  executedAt             DateTime?
+  resultJson             Json?
+  attributedRevenuePaise Int                  @default(0)
+  createdAt              DateTime             @default(now())
+  updatedAt              DateTime             @updatedAt
+}
+
+model RevenueAuditEvent {
+  id            String          @id @default(uuid())
+  incidentId    String
+  incident      RevenueIncident @relation(fields: [incidentId], references: [id])
+  eventType     String
+  actorType     String
+  actorId       String?
+  policyVersion String?
+  rationale     String
+  dataJson      Json
+  createdAt     DateTime        @default(now())
+}
+
+model RevenueExperiment {
+  id                    String                    @id @default(uuid())
+  name                  String
+  cohortSize            Int
+  totalValueAtRiskPaise Int
+  policyVersion         String
+  modelRef              String
+  promptVersion         String
+  cohortFingerprint     String
+  baselineJson          Json
+  metricsJson           Json
+  startedAt             DateTime                  @default(now())
+  completedAt           DateTime
+  results               RevenueExperimentResult[]
+}
+
+model RevenueExperimentResult {
+  id                     String            @id @default(uuid())
+  experimentId           String
+  experiment             RevenueExperiment @relation(fields: [experimentId], references: [id])
+  incidentId             String
+  incident               RevenueIncident   @relation(fields: [incidentId], references: [id])
+  finalState             String
+  recoveredValuePaise    Int               @default(0)
+  interventionCount      Int               @default(0)
+  unsafeActionsPrevented Int               @default(0)
+  snapshotJson           Json
+  recordedAt             DateTime          @default(now())
+
+  @@unique([experimentId, incidentId])
 }

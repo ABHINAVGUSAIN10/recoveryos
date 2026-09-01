@@ -1,4 +1,4 @@
-export const DEFAULT_GROQ_EVALUATION_INTERVAL_MS = 4_000;
+export const DEFAULT_GROQ_EVALUATION_INTERVAL_MS = 9_000;
 
 type HeaderContainer = { get?: (name: string) => string | null } & Record<string, unknown>;
 
@@ -23,7 +23,9 @@ export function rateLimitRetryDelayMs(error: unknown, maximumMs = 30_000): numbe
       if (Number.isFinite(retryDate)) delayMs = Math.max(0, retryDate - Date.now());
     }
   }
-  return Math.min(maximumMs, Math.max(250, delayMs));
+  // A small margin avoids retrying on the exact rolling-window boundary and
+  // consuming the only bounded retry while the provider still reports 429.
+  return Math.min(maximumMs, Math.max(1_000, delayMs + 750));
 }
 
 export function evaluationPacingDelayMs(lastStartedAt: number | null, now: number, intervalMs: number): number {

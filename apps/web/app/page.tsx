@@ -74,7 +74,7 @@ export default function Dashboard() {
       setSelectedRevenueExperiment(current => experimentData.find((experiment: RevenueExperiment) => experiment.id === current?.id) ?? experimentData[0] ?? null);
       setSelectedBatch(current => batchData.find((batch: Batch) => batch.id === current?.id) ?? batchData[0] ?? null);
       setError('');
-    } catch { setError('Start the API and seed the deterministic cohort with pnpm simulate.'); }
+    } catch { setError('RecoveryOS could not reach the deployed API. Refresh the page and try again.'); }
     finally { setLoading(false); }
   };
   const open = async (id: string) => { const response = await apiFetch(`/incidents/${id}`); if (response.ok) setDetail(await response.json()); };
@@ -85,8 +85,8 @@ export default function Dashboard() {
   const runRevenueDemo = async () => { setRevenueBusy(true); setRevenueError(''); try { const response = await apiFetch('/revenue/demo-runs', { method: 'POST' }); const body = await response.json(); if (!response.ok) throw new Error(Array.isArray(body.message) ? body.message.join(' ') : body.message || 'Inbound revenue demonstration failed'); setRevenueRun(body); setSelectedRevenueExperiment(body.experiment); setRevenueIncidents(body.incidents); setRevenueDetail(body.incidents[0] ?? null); setNotice(`Completed immutable experiment ${body.experiment.name}`); await load(); } catch (error) { setRevenueError(error instanceof Error ? error.message : 'Inbound revenue demonstration failed'); } finally { setRevenueBusy(false); } };
   const createBatch = async () => { if (!incidents.length) return; const response = await apiFetch('/batches', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: `Operator filtered page ${new Date().toLocaleString()}`, incidentIds: incidents.map(incident => incident.id) }) }); if (response.ok) { const batch = await response.json(); setNotice(`Created ${batch.name}`); setSelectedBatch(batch); await load(); } else setNotice('Your role cannot create a batch.'); };
   const savePolicy = async () => { if (!policy) return; const response = await apiFetch('/policies', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(policy) }); if (response.ok) { setPolicy(await response.json()); setNotice('Policy version activated.'); } else setNotice('Admin authorization is required to update policy.'); };
-  const connect = async () => { sessionStorage.setItem('recoveryos-token', tokenInput); setAuthToken(tokenInput); await load(tokenInput); };
-  const disconnect = async () => { sessionStorage.removeItem('recoveryos-token'); setAuthToken(''); setTokenInput(''); await load(''); };
+  const connect = async () => { const token = tokenInput.trim(); if (!token) { setError('AUTH_REQUIRED'); return; } sessionStorage.setItem('recoveryos-token', token); setAuthToken(token); await load(token); };
+  const disconnect = () => { sessionStorage.removeItem('recoveryos-token'); setAuthToken(''); setTokenInput(''); setError('AUTH_REQUIRED'); setLoading(false); };
   const downloadBatch = async (batch: Batch, format: 'csv' | 'json') => { const response = await apiFetch(`/batches/${batch.id}/export.${format}`); if (!response.ok) { setNotice('Authentication is required to download evidence.'); return; } const blob = await response.blob(); const url = URL.createObjectURL(blob); const anchor = document.createElement('a'); anchor.href = url; anchor.download = `${batch.name.replaceAll(/[^a-z0-9]+/gi, '-').toLowerCase()}.${format}`; anchor.click(); URL.revokeObjectURL(url); };
   const runDemo = async (scenario: string) => {
     setDemoBusy(true); setDemoError('');
@@ -124,7 +124,12 @@ export default function Dashboard() {
     setSearch(runSearch); setStatusFilter(''); setReviewOnly(false); setView('incidents'); setDetail(incident);
     await load(authToken, 1, { search: runSearch, statusFilter: '', reviewOnly: false });
   };
-  useEffect(() => { const stored = sessionStorage.getItem('recoveryos-token') || ''; setAuthToken(stored); setTokenInput(stored); load(stored); }, []);
+  useEffect(() => {
+    const stored = sessionStorage.getItem('recoveryos-token') || '';
+    setAuthToken(stored); setTokenInput(stored);
+    if (!stored) { setError('AUTH_REQUIRED'); setLoading(false); return; }
+    load(stored);
+  }, []);
   useEffect(() => {
     if (view !== 'demo' || !demoRun || !demoRun.incidents.some(incident => ['AUTO_RETRY', 'EXECUTING'].includes(incident.status))) return;
     const timer = window.setInterval(async () => {

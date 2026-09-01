@@ -13,6 +13,15 @@ export type RevenueDemoScenario = {
   expectedPolicyAction: string;
 };
 
+export function findRevenueDemoSeed(events: Array<{ dataJson: unknown }>) {
+  for (const event of events) {
+    if (!event.dataJson || typeof event.dataJson !== 'object') continue;
+    const data = event.dataJson as Record<string, unknown>;
+    if (typeof data.scenarioKey === 'string' && typeof data.rulesBaselineEligible === 'boolean') return data;
+  }
+  return undefined;
+}
+
 /** Fixed controlled cohort. Outcomes are declared up front so runs are reproducible and never presented as production lift. */
 export const REVENUE_DEMO_SCENARIOS: RevenueDemoScenario[] = [
   {

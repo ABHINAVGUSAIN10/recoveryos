@@ -24,7 +24,7 @@ const PROVIDER_DEFAULTS: Record<Exclude<AiProvider, 'custom'>, { baseURL: string
 };
 
 const PROMPT_VERSION = 'classifier-v7';
-const REVENUE_PROMPT_VERSION = 'revenue-playbook-v1';
+const REVENUE_PROMPT_VERSION = 'revenue-playbook-v2';
 const GROQ_RESPONSE_FORMAT = {
   type: 'json_schema' as const,
   json_schema: {

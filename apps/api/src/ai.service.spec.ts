@@ -160,7 +160,7 @@ describe('AiService', () => {
     const create = jest.fn().mockResolvedValue({ choices: [{ message: { content: JSON.stringify(proposal) } }] });
     jest.spyOn(service as never, 'createClient').mockReturnValue({ chat: { completions: { create } } } as never);
     const result = await service.analyzeRevenue(revenueContext);
-    expect(result).toMatchObject({ modelRef: 'groq:openai/gpt-oss-120b', promptVersion: 'revenue-playbook-v1', proposal });
+    expect(result).toMatchObject({ modelRef: 'groq:openai/gpt-oss-120b', promptVersion: 'revenue-playbook-v2', proposal });
     expect(create).toHaveBeenCalledWith(expect.objectContaining({ response_format: expect.objectContaining({ type: 'json_schema', json_schema: expect.objectContaining({ strict: true, name: 'revenue_recovery_playbook' }) }) }));
   });
 

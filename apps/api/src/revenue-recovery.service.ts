@@ -7,7 +7,7 @@ import { evaluateRevenuePolicy, revenueIncidentContextSchema, revenueProposalSch
 import { AiService } from './ai.service';
 import { PrismaService } from './prisma.service';
 import { DEFAULT_GROQ_EVALUATION_INTERVAL_MS, evaluationPacingDelayMs, wait } from './provider-rate-limit';
-import { REVENUE_DEMO_SCENARIOS, type RevenueDemoScenario } from './revenue-demo-scenarios';
+import { findRevenueDemoSeed, REVENUE_DEMO_SCENARIOS, type RevenueDemoScenario } from './revenue-demo-scenarios';
 
 const REVENUE_POLICY: RevenuePolicyConfig = {
   version: 'revenue-v1.0.0', maxAutomaticAttempts: 2, maxAutonomousAmountPaise: 1_000_000,
@@ -290,8 +290,7 @@ export class RevenueRecoveryService implements OnApplicationBootstrap {
     } });
     const results = incidents.map(incident => {
       const analysis = incident.analyses[0]; const decision = incident.policyDecisions[0];
-      const seed = incident.events.find(event => (event.dataJson as { scenarioKey?: unknown })?.scenarioKey);
-      const seedData = seed?.dataJson as { scenarioKey?: unknown; rulesBaselineEligible?: unknown; expectedCategory?: unknown; expectedPolicyAction?: unknown } | undefined;
+      const seedData = findRevenueDemoSeed(incident.events);
       const snapshot = {
         incident: { id: incident.id, sourcePaymentId: incident.sourcePaymentId, status: incident.status, amountPaise: incident.amountPaise, currency: incident.currency, paymentMethod: incident.paymentMethod, failureCode: incident.failureCode, failureDescription: incident.failureDescription, consentToContact: incident.consentToContact, attemptCount: incident.attemptCount, detectedAt: incident.detectedAt.toISOString(), recoveredAt: incident.recoveredAt?.toISOString() ?? null },
         scenarioKey: seedData?.scenarioKey ?? null,

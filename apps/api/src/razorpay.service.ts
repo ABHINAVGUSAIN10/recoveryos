@@ -74,13 +74,15 @@ export class RazorpayService {
     const enabled = process.env.ENABLE_RAZORPAYX_TEST_DEMO === 'true';
     const simulationSafe = this.simulation;
     const testCredentials = Boolean(process.env.RAZORPAY_KEY_ID?.startsWith('rzp_test_') && process.env.RAZORPAY_KEY_SECRET);
-    const fundAccountConfigured = Boolean(process.env.RAZORPAYX_TEST_DEMO_FUND_ACCOUNT_ID?.startsWith('fa_'));
+    const fundAccountId = process.env.RAZORPAYX_TEST_DEMO_FUND_ACCOUNT_ID || '';
+    const fundAccountConfigured = Boolean(fundAccountId.startsWith('fa_'));
     return {
       enabled,
       ready: enabled && simulationSafe && testCredentials && fundAccountConfigured,
       testMode: testCredentials,
       simulationSafe,
       fundAccountConfigured,
+      fundAccountDisplay: fundAccountConfigured ? `fa_…${fundAccountId.slice(-6)}` : undefined,
       amountPaise: RAZORPAYX_TEST_DEMO_AMOUNT_PAISE,
       confirmation: RAZORPAYX_TEST_DEMO_CONFIRMATION,
     };

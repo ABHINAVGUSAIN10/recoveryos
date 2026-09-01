@@ -11,6 +11,7 @@ type RawRequest = Request & { rawBody?: Buffer };
 @Roles('VIEWER')
 export class AppController {
   constructor(private readonly recovery: RecoveryService, private readonly revenue: RevenueRecoveryService) {}
+  @Get('/session') session(@Req() req: AuthenticatedRequest) { return req.recoveryActor; }
   @Public()
   @Get('/health') health() { return this.recovery.health(); }
   @Public()

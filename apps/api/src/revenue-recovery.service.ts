@@ -58,7 +58,7 @@ export class RevenueRecoveryService implements OnApplicationBootstrap {
         duplicateReplayVerified[scenario.key] = replay.duplicate && replay.incidentId === first.incidentId;
       }
       await this.waitForActions(ids, retryDelaySeconds * 1_000 + 15_000);
-      const experiment = await this.createExperiment(`Inbound revenue controlled cohort ${runId}`, ids);
+      const experiment = await this.createExperiment(`Inbound revenue controlled cohort ${runId}`, ids, duplicateReplayVerified);
       const incidents = await Promise.all(ids.map(id => this.detail(id)));
       return { runId, retryDelaySeconds, duplicateReplayVerified, experiment, incidents };
     } finally { this.demoActive = false; }
@@ -283,7 +283,7 @@ export class RevenueRecoveryService implements OnApplicationBootstrap {
     throw new ServiceUnavailableException('Revenue demonstration actions did not settle before the evidence snapshot deadline');
   }
 
-  private async createExperiment(name: string, incidentIds: string[]) {
+  private async createExperiment(name: string, incidentIds: string[], duplicateReplayVerified: Record<string, boolean> = {}) {
     const incidents = await this.prisma.revenueIncident.findMany({ where: { id: { in: incidentIds } }, include: {
       events: { orderBy: { occurredAt: 'asc' } }, analyses: { orderBy: { createdAt: 'desc' }, take: 1 },
       policyDecisions: { orderBy: { createdAt: 'desc' }, take: 1 }, actions: true, auditEvents: true,
@@ -317,6 +317,8 @@ export class RevenueRecoveryService implements OnApplicationBootstrap {
       manualReviewRequired: results.filter(result => ([RevenueIncidentStatus.APPROVAL_REQUIRED, RevenueIncidentStatus.ESCALATED] as RevenueIncidentStatus[]).includes(result.finalState)).length,
       interventions: results.reduce((sum, result) => sum + result.interventionCount, 0),
       unsafeActionsPrevented: results.reduce((sum, result) => sum + result.unsafeActionsPrevented, 0),
+      duplicateReplayCount: Object.values(duplicateReplayVerified).filter(Boolean).length,
+      duplicateReplayTotal: Object.keys(duplicateReplayVerified).length,
       statusDistribution: results.reduce<Record<string, number>>((acc, result) => { acc[result.finalState] = (acc[result.finalState] || 0) + 1; return acc; }, {}),
       evidenceCompleteness: results.every(result => Boolean(result.snapshot.analysis?.timelineDigest && result.snapshot.policyDecision?.policyVersion)) ? 1 : 0,
     };

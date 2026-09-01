@@ -41,4 +41,8 @@ describe('AppController Razorpay webhook', () => {
     expect(revenue.ingestPaymentWebhook).toHaveBeenCalledWith('event-payment-1', 'payment.failed', paymentPayload);
     expect(recovery.ingestWebhook).not.toHaveBeenCalled();
   });
+
+  it('returns the authenticated actor for role-aware clients', () => {
+    expect(controller.session({ recoveryActor: { id: 'token:operator', role: 'OPERATOR' } } as never)).toEqual({ id: 'token:operator', role: 'OPERATOR' });
+  });
 });

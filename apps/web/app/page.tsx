@@ -22,6 +22,39 @@ type RevenueExperiment = { id: string; name: string; cohortSize: number; totalVa
 type RevenueConfiguration = { enabled: boolean; simulationSafe: boolean; aiConfigured: boolean; ready: boolean; policy: { version: string; maxAutomaticAttempts: number; maxAutonomousAmountPaise: number; minimumRetryDelayMinutes: number; minimumConfidence: number }; scenarios: { key: string; title: string; amountPaise: number; expectedCategory: string; expectedPolicyAction: string }[] };
 type RevenueDemoRun = { runId: string; retryDelaySeconds: number; duplicateReplayVerified: Record<string, boolean>; experiment: RevenueExperiment; incidents: RevenueIncident[] };
 type View = 'revenue' | 'incidents' | 'batches' | 'demo' | 'policy' | 'operations';
+type IconName = View | 'refresh' | 'signout';
+
+const viewCopy: Record<View, { eyebrow: string; title: string; description: string }> = {
+  revenue: { eyebrow: 'Revenue intelligence', title: 'Recovery overview', description: 'Measure recovered value, understand intervention lift, and find the cases that still need attention.' },
+  incidents: { eyebrow: 'Payout operations', title: 'Payout incident queue', description: 'Triage payout failures, review bounded retries, and inspect the evidence behind every decision.' },
+  batches: { eyebrow: 'Audit and outcomes', title: 'Evidence ledger', description: 'Review immutable experiment snapshots and export the records behind each recovery metric.' },
+  demo: { eyebrow: 'Presenter workspace', title: 'Guided recovery demo', description: 'Watch AI advice pass through policy, durable execution, and provider confirmation in real time.' },
+  policy: { eyebrow: 'Authorization boundary', title: 'Recovery policy', description: 'Control the deterministic rules that can authorize or block a financial action.' },
+  operations: { eyebrow: 'System readiness', title: 'Operations', description: 'Verify data services, worker queues, provider configuration, and simulation safety before a run.' },
+};
+
+const navItems: { view: View; label: string }[] = [
+  { view: 'revenue', label: 'Overview' },
+  { view: 'incidents', label: 'Payout queue' },
+  { view: 'batches', label: 'Evidence' },
+  { view: 'demo', label: 'Guided demo' },
+  { view: 'policy', label: 'Policy' },
+  { view: 'operations', label: 'Operations' },
+];
+
+function Icon({ name }: { name: IconName }) {
+  const shapes: Record<IconName, React.ReactNode> = {
+    revenue: <><rect x="3.5" y="3.5" width="6" height="6" rx="1.5" /><rect x="14.5" y="3.5" width="6" height="6" rx="1.5" /><rect x="3.5" y="14.5" width="6" height="6" rx="1.5" /><path d="M15 19.5v-3.2m2.8 3.2v-6m2.7 6v-9" /></>,
+    incidents: <><path d="M5 6h14M5 12h14M5 18h9" /><circle cx="18" cy="18" r="2.5" /></>,
+    batches: <><path d="M7 3.5h7l4 4V20.5H7z" /><path d="M14 3.5v4h4M10 12h5M10 16h5" /></>,
+    demo: <><rect x="3.5" y="5" width="17" height="14" rx="3" /><path d="m10 9 5 3-5 3z" /></>,
+    policy: <><path d="M12 3.5 19 6v5.2c0 4.5-2.7 7.7-7 9.3-4.3-1.6-7-4.8-7-9.3V6z" /><path d="m9 12 2 2 4-4" /></>,
+    operations: <><path d="M3.5 12h3l2-5 3 10 2.5-7 2 4h4.5" /><circle cx="12" cy="12" r="9" /></>,
+    refresh: <><path d="M20 7v5h-5M4 17v-5h5" /><path d="M6.1 8.2A7 7 0 0 1 18.7 10M17.9 15.8A7 7 0 0 1 5.3 14" /></>,
+    signout: <><path d="M14 8V5H5v14h9v-3M10 12h11M18 9l3 3-3 3" /></>,
+  };
+  return <svg className="icon" aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">{shapes[name]}</svg>;
+}
 
 const api = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001/api/v1';
 const money = (paise: number) => new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR' }).format(paise / 100);
@@ -195,12 +228,15 @@ export default function Dashboard() {
   const metrics = selectedBatch?.metrics ?? liveMetrics;
   const sortedIncidents = useMemo(() => [...incidents].sort((left, right) => payoutSort === 'amount' ? right.amountPaise - left.amountPaise : payoutSort === 'status' ? left.status.localeCompare(right.status) : new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime()), [incidents, payoutSort]);
 
-  return <><a className="skip-link" href="#main-content">Skip to main content</a><main id="main-content">
-    <header><div><p className="eyebrow">RECOVERYOS · AI REVENUE RECOVERY</p><h1>Revenue recovery command center</h1><p className="subtle">Prioritize money at risk, review exceptions, and trace every automated decision.</p></div><div className="header-meta"><div className="simulation">● CONTROLLED SIMULATION / TEST MODE</div>{session && <div className="session-chip"><span>Signed in as</span><strong>{session.role.toLowerCase()}</strong></div>}</div></header>
+  const activeCopy = viewCopy[view];
+  return <><a className="skip-link" href="#main-content">Skip to main content</a><div className={`app-shell ${error ? 'is-auth' : ''}`}>
+    {!error && <aside className="sidebar"><div className="brand-lockup"><span className="brand-mark" aria-hidden="true">R</span><span><strong>RecoveryOS</strong><small>Revenue operations</small></span></div><nav className="nav" aria-label="Primary navigation">{navItems.map(item => <button key={item.view} aria-current={view === item.view ? 'page' : undefined} className={view === item.view ? 'active' : ''} onClick={() => setView(item.view)}><Icon name={item.view} /><span>{item.label}</span></button>)}</nav><div className="sidebar-footer"><div className="simulation"><i aria-hidden="true" /><span><small>Environment</small><strong>Controlled test mode</strong></span></div>{session && <div className="sidebar-session"><span className="session-avatar" aria-hidden="true">{session.role.slice(0, 1)}</span><span><small>Signed in as</small><strong>{session.role.toLowerCase()}</strong></span>{authToken && <button className="icon-button dark" aria-label="Sign out" title="Sign out" onClick={disconnect}><Icon name="signout" /></button>}</div>}</div></aside>}
+    <main id="main-content" className="workbench">
+    <header className="topbar"><div><p className="eyebrow">{error ? 'RECOVERYOS · AI REVENUE RECOVERY' : activeCopy.eyebrow}</p><h1>{error ? 'Revenue recovery command center' : activeCopy.title}</h1><p className="subtle">{error ? 'Prioritize money at risk, review exceptions, and trace every automated decision.' : activeCopy.description}</p></div>{!error && <div className="topbar-actions"><span className={`sync-state ${operations?.status === 'ready' ? 'ready' : ''}`}><i aria-hidden="true" />{loading ? 'Syncing data' : operations?.status === 'ready' ? 'Systems ready' : 'Check readiness'}</span><button className="icon-button" aria-label="Refresh dashboard data" title="Refresh dashboard data" onClick={() => load()} disabled={loading}><Icon name="refresh" /></button></div>}</header>
     {error === 'AUTH_REQUIRED' && <section className="panel auth-panel" aria-labelledby="auth-title"><p className="eyebrow">INTERNAL DEMO ACCESS</p><h2 id="auth-title">Connect to RecoveryOS</h2><p>Use the viewer, operator, or administrator token supplied by the project owner. It is kept only in this browser tab.</p><label htmlFor="access-token">Access token</label><div><input id="access-token" type="password" autoComplete="off" value={tokenInput} onChange={event => setTokenInput(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') connect(); }} placeholder="Paste access token" /><button className="approve" onClick={connect}>Connect securely</button></div><small>This token screen is for the controlled demonstration. Production access should use organizational single sign-on.</small></section>}
     {error && error !== 'AUTH_REQUIRED' && <div className="empty panel" role="alert">{error}</div>}
     {!error && <>
-    <nav className="nav" aria-label="Primary navigation"><button aria-current={view === 'revenue' ? 'page' : undefined} className={view === 'revenue' ? 'active' : ''} onClick={() => setView('revenue')}>Overview</button><button aria-current={view === 'incidents' ? 'page' : undefined} className={view === 'incidents' ? 'active' : ''} onClick={() => setView('incidents')}>Payout queue</button><button aria-current={view === 'batches' ? 'page' : undefined} className={view === 'batches' ? 'active' : ''} onClick={() => setView('batches')}>Evidence</button><button aria-current={view === 'demo' ? 'page' : undefined} className={view === 'demo' ? 'active' : ''} onClick={() => setView('demo')}>Guided demo</button><button aria-current={view === 'policy' ? 'page' : undefined} className={view === 'policy' ? 'active' : ''} onClick={() => setView('policy')}>Policy</button><button aria-current={view === 'operations' ? 'page' : undefined} className={view === 'operations' ? 'active' : ''} onClick={() => setView('operations')}>Operations</button><span>{view === 'revenue' ? 'Inbound revenue recovered' : selectedBatch ? `Evidence: ${selectedBatch.name}` : 'Live payout metrics'}</span>{authToken && <button onClick={disconnect}>Sign out</button>}</nav>
+    <div className="context-bar"><span>{view === 'revenue' ? 'Inbound revenue recovery' : selectedBatch ? `Evidence snapshot · ${selectedBatch.name}` : 'Live payout operations'}</span><span><i aria-hidden="true" />AI advises <b>·</b> policy authorizes <b>·</b> every action is audited</span></div>
     {view !== 'revenue' && <><section className="metrics primary-metrics" aria-label="Payout recovery summary"><Metric label="Value at risk" value={money(metrics.valueAtRiskPaise)} /><Metric label="Recovered" value={money(metrics.recoveredValuePaise)} accent="green" /><Metric label="Eligible recovery" value={`${(metrics.eligibleRecoveryRate * 100).toFixed(1)}%`} accent="green" /><Metric label="Needs attention" value={String(metrics.unresolvedIncidents)} accent="orange" /></section><details className="secondary-metrics"><summary>View additional payout metrics</summary><section className="metrics"><Metric label="Gross recovery" value={`${(metrics.recoveryRate * 100).toFixed(1)}%`} /><Metric label="Eligible value" value={money(metrics.eligibleValuePaise)} /><Metric label="Pending recovery" value={money(metrics.pendingRecoveryValuePaise)} /><Metric label="Protected value" value={money(metrics.protectedValuePaise)} accent="orange" /></section></details></>}
     <div className="announcer" aria-live="polite">{loading ? 'Updating dashboard data.' : ''}</div>
     {notice && <div className="notice" role="status"><span>{notice}</span><button onClick={() => setNotice('')}>Dismiss</button></div>}
@@ -211,7 +247,7 @@ export default function Dashboard() {
     {!error && view === 'policy' && policy && <PolicyWorkspace policy={policy} canAdmin={can(session, 'ADMIN')} onChange={setPolicy} onSave={savePolicy} />}
     {!error && view === 'operations' && <OperationsWorkspace operations={operations} onRefresh={() => load()} />}
     </>}
-  </main>{providerConfirmationOpen && operations?.razorpayTestDemo && <ProviderConfirmationDialog configuration={operations.razorpayTestDemo} onCancel={() => setProviderConfirmationOpen(false)} onConfirm={runRazorpayTestDemo} />}</>;
+  </main></div>{providerConfirmationOpen && operations?.razorpayTestDemo && <ProviderConfirmationDialog configuration={operations.razorpayTestDemo} onCancel={() => setProviderConfirmationOpen(false)} onConfirm={runRazorpayTestDemo} />}</>;
 }
 
 function Metric({ label, value, accent }: { label: string; value: string; accent?: string }) { return <article className={`metric ${accent || ''}`}><span>{label}</span><strong>{value}</strong></article>; }
@@ -281,6 +317,7 @@ function DemoWorkspace({ operations, run, providerRun, busy, providerBusy, error
     <div className="panel demo-control">
       <div className="panel-head"><div><p className="eyebrow">PRESENTER CONSOLE</p><h2>Live AI decision demonstration</h2><p>Every run creates normal incidents, policy evidence, queue actions, and an auditable batch.</p></div><span className={`badge ${demo?.ready ? 'good' : 'warn'}`}>{demo?.ready ? 'READY' : 'NOT READY'}</span></div>
       <div className="demo-preflight">{preflight.map(([label, ready, detail]) => <article key={label}><span>{label}</span><strong className={ready ? 'state-good' : 'state-warn'}>● {ready ? detail : 'UNAVAILABLE'}</strong></article>)}</div>
+      <div className={`decision-flow ${busy || providerBusy ? 'is-running' : ''}`} aria-label="Recovery decision flow"><article><span>01</span><div><strong>AI advises</strong><small>Classifies the failure</small></div></article><i aria-hidden="true" /><article><span>02</span><div><strong>Policy gates</strong><small>Authorizes or stops</small></div></article><i aria-hidden="true" /><article><span>03</span><div><strong>Action runs</strong><small>Durable and idempotent</small></div></article><i aria-hidden="true" /><article><span>04</span><div><strong>Provider confirms</strong><small>Closes only on evidence</small></div></article></div>
       {!demo?.enabled && <div className="demo-warning">Live demo controls are disabled on the API. Set <code>ENABLE_LIVE_DEMO=true</code> only while simulation mode is enabled.</div>}
       <section className="razorpay-test-card">
         <div className="razorpay-test-head"><div><p className="eyebrow">REAL PROVIDER · TEST MODE</p><h3>RazorpayX automatic retry</h3><p>AI recommends and policy authorizes a fixed ₹10,000 retry. The worker then creates an actual RazorpayX Test Mode payout to the configured dummy fund account.</p></div><span className={`badge ${providerDemo?.ready ? 'good' : 'warn'}`}>{providerDemo?.ready ? 'READY' : 'NOT READY'}</span></div>

@@ -528,6 +528,12 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .badge.neutral { background: var(--blue-soft); color: var(--blue-deep); }
 
 .filters { background: #fafcfb; }
+.content > .list .filters { display: flex; flex-wrap: wrap; align-items: center; overflow: visible; }
+.content > .list .filters > input[type="text"] { width: auto; flex: 2 1 240px; }
+.content > .list .filters > select { width: auto; flex: 1 1 145px; }
+.content > .list .filters > label { min-width: 0; min-height: 40px; flex: 1 1 170px; align-items: center; white-space: normal; }
+.content > .list .filters > label input { flex: 0 0 auto; }
+.content > .list .filters > button { flex: 0 0 auto; }
 .filters input[type="text"], .filters input:not([type]), .filters select, .policy-form input, .auth-panel input, .remediation input, .remediation textarea { border-color: var(--line-strong); border-radius: 10px; transition: border-color 150ms var(--ease-out), box-shadow 150ms var(--ease-out), background-color 150ms var(--ease-out); }
 .filters input:focus, .filters select:focus, .policy-form input:focus, .auth-panel input:focus, .remediation input:focus, .remediation textarea:focus { border-color: var(--blue); box-shadow: 0 0 0 3px #335cff1a; outline: 0; }
 .case-header { background: #f7f9f8; }
@@ -621,6 +627,8 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
   .topbar-actions { width: 100%; justify-content: space-between; }
   .context-bar { align-items: flex-start; flex-direction: column; padding: 10px 12px; }
   .context-bar > span:last-child { line-height: 1.5; }
+  .content > .list .filters > input[type="text"] { flex-basis: 100%; }
+  .content > .list .filters > label { flex-basis: 100%; }
   .decision-flow { grid-template-columns: 1fr; gap: 7px; }
   .decision-flow > i { width: 2px; height: 13px; margin-left: 12px; }
   .decision-flow article > span { border-radius: 8px; }

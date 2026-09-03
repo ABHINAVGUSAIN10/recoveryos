@@ -521,6 +521,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .metric strong { display: block; font-size: clamp(22px, 2vw, 28px); line-height: 1.05; font-variant-numeric: tabular-nums; }
 .panel-head { padding: 21px 22px; }
 .approve { border-color: var(--blue); background: var(--blue); box-shadow: 0 6px 15px #335cff2e; color: white; }
+.approve:disabled { opacity: 1; border-color: #bdcaff; background: #dfe6ff; box-shadow: none; color: #33467f; }
 .danger { border-color: #f1c2bd; color: var(--red); }
 .badge { border-radius: 8px; }
 .badge.good { background: var(--green-soft); color: var(--green); }
@@ -545,6 +546,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .evidence { background: var(--blue-soft); box-shadow: inset 0 0 0 1px #dce3ff; }
 .evidence.policy, .playbook, .action-ledger { background: #f6f8f7; box-shadow: inset 0 0 0 1px var(--line); }
 .sticky-action { border-color: #cdd7ff; border-radius: 13px; background: #f4f6ff; box-shadow: 0 8px 22px #2342c01f; }
+.action-error { margin-top: 5px; color: var(--red) !important; font-weight: 700 !important; line-height: 1.45; }
 .notice, .role-banner { border: 0; border-radius: 12px; background: var(--blue-soft); box-shadow: inset 0 0 0 1px #d9e1ff; color: var(--blue-deep); }
 .batch-card { background: white; box-shadow: none; }
 .batch-card.selected { background: var(--blue-soft); }

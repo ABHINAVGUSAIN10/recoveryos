@@ -257,6 +257,7 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .nav button { flex: none; }
 .nav span { font-size: 13px; }
 .primary-metrics { grid-template-columns: repeat(4, 1fr); }
+.portfolio-label { margin: 2px 0 9px; }
 .metric { padding: 18px; }
 .metric span { font-size: 13px; margin-bottom: 9px; }
 .metric strong { font-size: 24px; }

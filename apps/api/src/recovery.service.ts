@@ -3,7 +3,7 @@ import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { createHash, randomBytes } from 'crypto';
 import { Decision, ExecutionOutcome, IncidentStatus, Prisma, ReviewKind, ReviewStatus } from '@prisma/client';
-import { aiProposalSchema, beneficiaryRemediationSchema, evaluatePolicy, incidentSchema, policyConfigSchema, type BeneficiaryRemediation, type Incident, type PolicyConfig } from '@recoveryos/domain';
+import { aiProposalSchema, beneficiaryRemediationSchema, evaluatePolicy, incidentSchema, policyConfigSchema, type Incident, type PolicyConfig } from '@recoveryos/domain';
 import { PrismaService } from './prisma.service';
 import { AiService } from './ai.service';
 import {
@@ -18,7 +18,7 @@ import { safeErrorMessage } from './redaction';
 import { DEMO_SCENARIOS, demoScenarioSchema } from './demo-scenarios';
 
 const DEFAULT_POLICY: PolicyConfig = { version: 'v1.0.0', maxAutoRetryAttempts: 2, maxAutonomousAmountPaise: 1_000_000, minimumRetryDelayMinutes: 30 };
-type BatchWithIncidents = Prisma.BatchRunGetPayload<{ include: { results: { include: { incident: true } } } }>;
+type BatchWithIncidents = Prisma.BatchRunGetPayload<{ include: { results: { include: { incident: { include: { auditEvents: true; executions: true } } } } } }>;
 type IncidentListQuery = { page?: number; pageSize?: number; search?: string; status?: string; reviewRequired?: boolean };
 type DemoAnalysisContext = { runId: string; actorId: string; retryDelaySeconds: number; executionMode?: 'SIMULATED' | 'RAZORPAYX_TEST' };
 @Injectable()
@@ -218,9 +218,22 @@ export class RecoveryService implements OnApplicationBootstrap {
     const stored = await this.prisma.policyConfig.findFirst({ where: { active: true }, orderBy: { effectiveAt: 'desc' } });
     return stored ? policyConfigSchema.parse(stored.rulesJson) : DEFAULT_POLICY;
   }
-  async updatePolicy(config: PolicyConfig, actorId = 'admin') {
-    const parsed = policyConfigSchema.parse(config);
-    await this.prisma.$transaction(async db => { await db.policyConfig.updateMany({ where: { active: true }, data: { active: false } }); await db.policyConfig.upsert({ where: { version: parsed.version }, update: { rulesJson: parsed, active: true, createdBy: actorId }, create: { version: parsed.version, rulesJson: parsed, createdBy: actorId } }); });
+  async updatePolicy(config: unknown, actorId = 'admin') {
+    const result = policyConfigSchema.safeParse(config);
+    if (!result.success) throw new BadRequestException(`Invalid policy configuration: ${result.error.issues.map(issue => `${issue.path.join('.')}: ${issue.message}`).join('; ')}`);
+    const parsed = result.data;
+    const existing = await this.prisma.policyConfig.findUnique({ where: { version: parsed.version } });
+    if (existing) {
+      const stored = policyConfigSchema.parse(existing.rulesJson);
+      if (JSON.stringify(stored) !== JSON.stringify(parsed)) {
+        throw new ConflictException(`Policy version ${parsed.version} is immutable; publish changed rules under a new version`);
+      }
+    }
+    await this.prisma.$transaction(async db => {
+      await db.policyConfig.updateMany({ where: { active: true }, data: { active: false } });
+      if (existing) await db.policyConfig.update({ where: { version: parsed.version }, data: { active: true } });
+      else await db.policyConfig.create({ data: { version: parsed.version, rulesJson: parsed, createdBy: actorId } });
+    });
     return parsed;
   }
   async ingestWebhook(externalEventId: string, eventType: string, payload: any, demoContext?: DemoAnalysisContext) {
@@ -228,10 +241,14 @@ export class RecoveryService implements OnApplicationBootstrap {
     if (existing) return { duplicate: true, incidentId: existing.payoutIncidentId };
     const entity = payload?.payload?.payout?.entity ?? payload?.payout ?? payload;
     const payoutId = entity?.id ?? entity?.payout_id;
-    if (!payoutId) throw new Error('Webhook payload does not contain payout id');
+    if (typeof payoutId !== 'string' || !payoutId.trim()) throw new BadRequestException('Webhook payload does not contain a valid payout id');
     const providerStatus = String(entity.status ?? 'failed').toUpperCase();
     const status = this.incidentStatusFromProvider(providerStatus);
-    const amountPaise = Number(entity.amount ?? 0); const reason = entity?.status_details?.description ?? entity?.status_details?.reason ?? entity?.failure_reason ?? null;
+    const amountPaise = Number(entity.amount ?? 0);
+    const currency = String(entity.currency ?? 'INR').toUpperCase();
+    if (!Number.isSafeInteger(amountPaise) || amountPaise <= 0) throw new BadRequestException('Webhook payout amount must be a positive integer in paise');
+    if (!/^[A-Z]{3}$/.test(currency)) throw new BadRequestException('Webhook payout currency must be a three-letter code');
+    const reason = entity?.status_details?.description ?? entity?.status_details?.reason ?? entity?.failure_reason ?? null;
     const recoveryIncidentId = incidentIdFromRecoveryReference(entity?.reference_id);
     let result;
     try {
@@ -247,9 +264,28 @@ export class RecoveryService implements OnApplicationBootstrap {
           return (execution.outcome === ExecutionOutcome.PENDING || execution.outcome === ExecutionOutcome.UNKNOWN) && typeof response?.id !== 'string';
         }) ?? null;
         const linkedRecovery = Boolean(recoveryIncidentId && recoveryExecution);
-        const incident = linkedRecovery
-          ? await db.payoutIncident.update({ where: { id: recoveryIncidentId! }, data: { status, currentReason: reason, amountPaise: amountPaise || undefined } })
-          : await db.payoutIncident.upsert({ where: { razorpayPayoutId: payoutId }, update: { status, currentReason: reason, amountPaise: amountPaise || undefined }, create: { razorpayPayoutId: payoutId, status, amountPaise, currency: entity.currency ?? 'INR', currentReason: reason, beneficiaryRef: entity.reference_id ?? null } });
+        const existingIncident = linkedRecovery
+          ? await db.payoutIncident.findUniqueOrThrow({ where: { id: recoveryIncidentId! } })
+          : await db.payoutIncident.findUnique({ where: { razorpayPayoutId: payoutId } });
+        const transition = this.providerTransition(existingIncident?.status ?? null, status, linkedRecovery);
+        const providerDataMismatch = Boolean(existingIncident && (
+          (typeof existingIncident.amountPaise === 'number' && existingIncident.amountPaise !== amountPaise)
+          || (typeof existingIncident.currency === 'string' && existingIncident.currency !== currency)
+        ));
+        const duplicateRecoveryDetected = Boolean(
+          linkedRecovery
+          && recoveryExecution
+          && status === IncidentStatus.RECOVERED
+          && existingIncident?.status === IncidentStatus.RECOVERED
+          && recoveryExecution.outcome !== ExecutionOutcome.SUCCEEDED,
+        );
+        const incident = existingIncident
+          ? await db.payoutIncident.update({ where: { id: existingIncident.id }, data: {
+              status: transition.status,
+              ...(transition.applied ? { currentReason: reason } : {}),
+              ...(duplicateRecoveryDetected ? { duplicateSuspected: true } : {}),
+            } })
+          : await db.payoutIncident.create({ data: { razorpayPayoutId: payoutId, status, amountPaise, currency, currentReason: reason, beneficiaryRef: entity.fund_account_id ?? entity.reference_id ?? null } });
         if (linkedRecovery && recoveryExecution) {
           const terminalOutcome = status === IncidentStatus.RECOVERED
             ? ExecutionOutcome.SUCCEEDED
@@ -271,8 +307,11 @@ export class RecoveryService implements OnApplicationBootstrap {
           seededProviderDemo ? 'Controlled temporary-failure seed persisted for a RazorpayX Test Mode recovery demonstration.' : `Provider event ${eventType} persisted`,
           { externalEventId, eventId: event.id },
         );
+        if (!transition.applied) await this.audit(db, incident.id, 'WEBHOOK_STATE_IGNORED', 'SYSTEM', `Provider event ${eventType} was recorded without regressing the incident workflow state.`, { externalEventId, currentStatus: existingIncident?.status, providerStatus, mappedStatus: status });
+        if (providerDataMismatch) await this.audit(db, incident.id, 'PROVIDER_DATA_MISMATCH', 'SYSTEM', 'A later event reported different financial identity fields; the incident retained its original amount and currency.', { externalEventId, reportedAmountPaise: amountPaise, reportedCurrency: currency, storedAmountPaise: existingIncident!.amountPaise, storedCurrency: existingIncident!.currency });
+        if (duplicateRecoveryDetected) await this.audit(db, incident.id, 'DUPLICATE_PAYOUT_CONFIRMED', 'SYSTEM', 'The original payout and its linked recovery payout both reached a successful provider state; recovered-value attribution is blocked.', { externalEventId, recoveryExecutionId: recoveryExecution!.id, recoveryPayoutId: payoutId });
         if (demoContext) await this.audit(db, incident.id, 'DEMO_SCENARIO_STARTED', 'HUMAN', `${seededProviderDemo ? 'RazorpayX Test Mode' : 'Live'} demonstration ${demoContext.runId} started by ${demoContext.actorId}`, { runId: demoContext.runId, executionMode: demoContext.executionMode || 'SIMULATED' }, undefined, undefined, demoContext.actorId);
-        return { incident, linkedRecovery };
+        return { incident, linkedRecovery, shouldAnalyze: transition.shouldAnalyze };
       });
     } catch (error) {
       if ((error as { code?: string })?.code === 'P2002') {
@@ -281,29 +320,35 @@ export class RecoveryService implements OnApplicationBootstrap {
       }
       throw error;
     }
-    if (result.incident.status !== IncidentStatus.RECOVERED && !(result.linkedRecovery && result.incident.status === IncidentStatus.PROCESSING)) await this.analyze(result.incident.id, demoContext);
+    if (result.shouldAnalyze) await this.analyze(result.incident.id, demoContext);
     return { duplicate: false, incidentId: result.incident.id };
   }
   async analyze(incidentId: string, demoContext?: DemoAnalysisContext) {
     const record = await this.prisma.payoutIncident.findUniqueOrThrow({ where: { id: incidentId } });
-    const incident = incidentSchema.parse({ id: record.id, razorpayPayoutId: record.razorpayPayoutId, status: record.status, amountPaise: record.amountPaise, currency: record.currency, reason: record.currentReason, beneficiaryRef: record.beneficiaryRef, attempts: record.attempts, duplicateSuspected: record.duplicateSuspected, policyVersion: (await this.getPolicy()).version });
-    const [analysis, config] = await Promise.all([this.ai.classify(incident), this.getPolicy()]);
+    // Capture one immutable policy snapshot for the advisory context, decision, and
+    // audit evidence. A concurrent policy activation must not split one decision
+    // across two versions.
+    const config = await this.getPolicy();
+    const incident = incidentSchema.parse({ id: record.id, razorpayPayoutId: record.razorpayPayoutId, status: record.status, amountPaise: record.amountPaise, currency: record.currency, reason: record.currentReason, beneficiaryRef: record.beneficiaryRef, attempts: record.attempts, duplicateSuspected: record.duplicateSuspected, policyVersion: config.version });
+    const analysis = await this.ai.classify(incident);
     const proposal = aiProposalSchema.parse(analysis.proposal); const result = evaluatePolicy(incident, proposal, config);
-    await this.prisma.$transaction(async db => {
+    const applied = await this.prisma.$transaction(async db => {
+      const status = record.status === IncidentStatus.PROCESSING ? IncidentStatus.PROCESSING : result.decision as IncidentStatus;
+      const claimed = await db.payoutIncident.updateMany({ where: { id: incidentId, status: record.status }, data: { status } });
+      if (!claimed.count) return false;
       await db.aiAnalysis.create({ data: { incidentId, modelRef: analysis.modelRef, promptVersion: analysis.promptVersion, outputJson: proposal, confidence: proposal.confidence } });
       await db.policyDecision.create({ data: { incidentId, policyVersion: config.version, proposedAction: proposal.recommendedAction, finalDecision: result.decision as Decision, reasonsJson: result.reasons } });
       // A processing payout has an ambiguous external outcome. Keep that state visible so
       // reconciliation, rather than a new payout request, is the only possible next step.
-      const status = record.status === IncidentStatus.PROCESSING ? IncidentStatus.PROCESSING : result.decision as IncidentStatus;
-      await db.payoutIncident.update({ where: { id: incidentId }, data: { status } });
       await this.audit(db, incidentId, 'POLICY_DECISION', 'POLICY', result.reasons.join('; '), { proposal, result }, config.version, result.decision);
       if (result.decision === 'ESCALATE' || result.decision === 'APPROVAL_REQUIRED') await db.reviewTask.create({ data: {
         incidentId,
         kind: result.decision === 'ESCALATE' ? ReviewKind.REMEDIATION : ReviewKind.RETRY_APPROVAL,
         severity: incident.amountPaise > config.maxAutonomousAmountPaise ? 'HIGH' : 'MEDIUM',
       } });
+      return true;
     });
-    if (result.decision === 'AUTO_RETRY') await this.scheduleRetry(incidentId, result.delayMinutes ?? config.minimumRetryDelayMinutes, demoContext);
+    if (applied && result.decision === 'AUTO_RETRY') await this.scheduleRetry(incidentId, result.delayMinutes ?? config.minimumRetryDelayMinutes, demoContext);
     return result;
   }
   private async scheduleRetry(incidentId: string, delayMinutes: number, demoContext?: DemoAnalysisContext) {
@@ -311,22 +356,26 @@ export class RecoveryService implements OnApplicationBootstrap {
     const key = recoveryIdempotencyKey(incident.id, incident.attempts + 1);
     const scheduledFor = new Date(Date.now() + (demoContext ? demoContext.retryDelaySeconds * 1_000 : delayMinutes * 60_000));
     const actionType = demoContext?.executionMode === 'RAZORPAYX_TEST' ? 'RAZORPAYX_TEST_PAYOUT' : 'RETRY_PAYOUT';
-    const execution = await this.prisma.actionExecution.upsert({ where: { idempotencyKey: key }, update: {}, create: { incidentId, actionType, idempotencyKey: key, requestHash: createHash('sha256').update(`${incident.razorpayPayoutId}:${key}:${actionType}`).digest('hex'), scheduledFor } });
-    await this.enqueueExecution(execution.id, execution.scheduledFor);
     const rationale = demoContext?.executionMode === 'RAZORPAYX_TEST'
       ? `Policy-authorized ₹10,000 RazorpayX Test Mode retry scheduled after a ${demoContext.retryDelaySeconds}-second presentation delay; the policy delay remains ${delayMinutes} minutes.`
       : demoContext
         ? `Policy delay ${delayMinutes} minutes compressed to ${demoContext.retryDelaySeconds} seconds for simulation demo ${demoContext.runId}`
       : `Retry scheduled in ${delayMinutes} minutes`;
-    await this.prisma.auditEvent.create({ data: { incidentId, eventType: 'ACTION_REQUESTED', actorType: 'SYSTEM', rationale, amountPaise: incident.amountPaise, dataJson: { executionId: execution.id, actionType, idempotencyKey: key, policyDelayMinutes: delayMinutes, effectiveDelaySeconds: demoContext?.retryDelaySeconds, demoRunId: demoContext?.runId } } });
+    const execution = await this.prisma.$transaction(async db => {
+      const durableExecution = await db.actionExecution.upsert({ where: { idempotencyKey: key }, update: {}, create: { incidentId, actionType, idempotencyKey: key, requestHash: createHash('sha256').update(`${incident.razorpayPayoutId}:${key}:${actionType}`).digest('hex'), scheduledFor } });
+      await db.auditEvent.create({ data: { incidentId, eventType: 'ACTION_REQUESTED', actorType: 'SYSTEM', rationale, amountPaise: incident.amountPaise, dataJson: { executionId: durableExecution.id, actionType, idempotencyKey: key, policyDelayMinutes: delayMinutes, effectiveDelaySeconds: demoContext?.retryDelaySeconds, demoRunId: demoContext?.runId } } });
+      return durableExecution;
+    });
+    await this.enqueueExecution(execution.id, execution.scheduledFor);
   }
   private async enqueueExecution(executionId: string, scheduledFor: Date) {
     const delay = Math.max(0, scheduledFor.getTime() - Date.now());
     await this.queue.add('execute-retry', { executionId }, {
       jobId: executionId,
       delay,
-      attempts: 3,
-      backoff: { type: 'exponential', delay: 1000 },
+      // A failed financial provider call is reconciled or reviewed; BullMQ must not
+      // blindly invoke the provider a second time, even with the same worker job.
+      attempts: 1,
       removeOnComplete: { age: 7 * 24 * 60 * 60, count: 1_000 },
       removeOnFail: { age: 30 * 24 * 60 * 60, count: 1_000 },
     });
@@ -340,15 +389,20 @@ export class RecoveryService implements OnApplicationBootstrap {
     if (approved && typeof remediation?.remediatedBy === 'string' && remediation.remediatedBy === actorId) {
       throw new ConflictException('Maker-checker control requires a different actor to approve the remediated retry');
     }
+    const policy = approved ? await this.getPolicy() : null;
     await this.prisma.$transaction(async db => {
-      await db.reviewTask.update({ where: { id: task.id }, data: { status: approved ? ReviewStatus.APPROVED : ReviewStatus.REJECTED, decision: approved ? 'APPROVE_RETRY' : 'REJECT', decidedAt: new Date(), actorId } });
-      await db.payoutIncident.update({ where: { id: incidentId }, data: { status: approved ? IncidentStatus.AUTO_RETRY : IncidentStatus.STOPPED } });
+      const claimedTask = await db.reviewTask.updateMany({ where: { id: task.id, status: ReviewStatus.OPEN }, data: { status: approved ? ReviewStatus.APPROVED : ReviewStatus.REJECTED, decision: approved ? 'APPROVE_RETRY' : 'REJECT', decidedAt: new Date(), actorId } });
+      if (!claimedTask.count) throw new ConflictException('This review task has already been decided');
+      const claimedIncident = await db.payoutIncident.updateMany({ where: { id: incidentId, status: task.incident.status }, data: { status: approved ? IncidentStatus.AUTO_RETRY : IncidentStatus.STOPPED } });
+      if (!claimedIncident.count) throw new ConflictException('The incident changed while this review was being decided');
       await this.audit(db, incidentId, approved ? 'HUMAN_APPROVED_RETRY' : 'HUMAN_REJECTED', 'HUMAN', `Review task ${approved ? 'approved for retry' : 'rejected'} by ${actorId}`, { reviewTaskId: task.id, reviewKind: task.kind }, undefined, approved ? 'AUTO_RETRY' : 'STOPPED', actorId);
     });
-    if (approved) await this.scheduleRetry(incidentId, 0);
+    if (approved) await this.scheduleRetry(incidentId, policy!.minimumRetryDelayMinutes);
   }
-  async remediateIncident(incidentId: string, input: BeneficiaryRemediation, actorId = 'operator') {
-    const remediation = beneficiaryRemediationSchema.parse(input);
+  async remediateIncident(incidentId: string, input: unknown, actorId = 'operator') {
+    const result = beneficiaryRemediationSchema.safeParse(input);
+    if (!result.success) throw new BadRequestException(`Invalid remediation: ${result.error.issues.map(issue => `${issue.path.join('.')}: ${issue.message}`).join('; ')}`);
+    const remediation = result.data;
     const task = await this.prisma.reviewTask.findFirst({
       where: { incidentId, status: ReviewStatus.OPEN, kind: ReviewKind.REMEDIATION },
       include: { incident: true },
@@ -360,18 +414,20 @@ export class RecoveryService implements OnApplicationBootstrap {
     const policy = await this.getPolicy();
     const beneficiaryRefHash = createHash('sha256').update(remediation.beneficiaryRef).digest('hex');
     await this.prisma.$transaction(async db => {
-      await db.reviewTask.update({ where: { id: task.id }, data: {
+      const claimedTask = await db.reviewTask.updateMany({ where: { id: task.id, status: ReviewStatus.OPEN, kind: ReviewKind.REMEDIATION }, data: {
         status: ReviewStatus.APPROVED,
         decision: 'REMEDIATED',
         remediationJson: { beneficiaryRefHash, note: remediation.note },
         decidedAt: new Date(),
         actorId,
       } });
-      await db.payoutIncident.update({ where: { id: incidentId }, data: {
+      if (!claimedTask.count) throw new ConflictException('This remediation task has already been completed');
+      const claimedIncident = await db.payoutIncident.updateMany({ where: { id: incidentId, status: IncidentStatus.ESCALATE }, data: {
         status: IncidentStatus.APPROVAL_REQUIRED,
         beneficiaryRef: remediation.beneficiaryRef,
         currentReason: 'Beneficiary remediation recorded; a separate actor must approve the retry.',
       } });
+      if (!claimedIncident.count) throw new ConflictException('The incident changed while remediation was being recorded');
       await db.policyDecision.create({ data: {
         incidentId,
         policyVersion: policy.version,
@@ -405,6 +461,32 @@ export class RecoveryService implements OnApplicationBootstrap {
     ]);
     return { items, total, page, pageSize, totalPages: Math.max(1, Math.ceil(total / pageSize)) };
   }
+  async operationalMetrics() {
+    const incidents = await this.prisma.payoutIncident.findMany({
+      include: {
+        analyses: { orderBy: { createdAt: 'desc' }, take: 1 },
+        policyDecisions: { orderBy: { createdAt: 'desc' }, take: 1 },
+        executions: true,
+        auditEvents: { where: { eventType: { in: ['HUMAN_APPROVED', 'HUMAN_APPROVED_RETRY', 'HUMAN_REJECTED', 'BENEFICIARY_REMEDIATED'] } } },
+      },
+    });
+    const results = incidents.map(incident => {
+      const proposal = aiProposalSchema.safeParse(incident.analyses[0]?.outputJson);
+      const decision = incident.policyDecisions[0];
+      const eligibleForRecovery = proposal.success
+        ? proposal.data.category === 'TRANSIENT_TECHNICAL' && proposal.data.recommendedAction === 'RETRY'
+        : decision?.finalDecision === Decision.AUTO_RETRY;
+      return {
+        finalState: incident.status,
+        recoveredValuePaise: this.attributedPayoutValue(incident),
+        eligibleForRecovery,
+        humanInterventions: incident.auditEvents.length,
+        unsafeActionsPrevented: this.unsafeActionPrevented(incident.analyses[0]?.outputJson, decision?.finalDecision) ? 1 : 0,
+        snapshot: { incident: { amountPaise: incident.amountPaise } },
+      };
+    });
+    return this.calculateBatchMetrics(results, incidents.reduce((sum, incident) => sum + incident.amountPaise, 0));
+  }
   async incidentDetail(id: string) { return this.prisma.payoutIncident.findUniqueOrThrow({ where: { id }, include: { events: true, analyses: { orderBy: { createdAt: 'asc' } }, policyDecisions: { orderBy: { createdAt: 'asc' } }, executions: true, reviewTasks: true, auditEvents: { orderBy: { createdAt: 'asc' } } } }); }
   async reconcileOpen() {
     const open = await this.prisma.payoutIncident.findMany({
@@ -427,7 +509,7 @@ export class RecoveryService implements OnApplicationBootstrap {
               : await this.razorpay.fetchPayout(recoveryPayoutId)
             : execution.actionType === 'RAZORPAYX_TEST_PAYOUT'
               ? await this.razorpay.executeTestDemoPayout(execution.idempotencyKey, incident.id)
-              : await this.razorpay.executeRecovery(execution.idempotencyKey, incident.razorpayPayoutId, incident.id)
+              : await this.razorpay.executeRecovery(execution.idempotencyKey, incident.razorpayPayoutId, incident.id, incident.beneficiaryRef)
           : await this.razorpay.fetchPayout(incident.razorpayPayoutId);
         const providerStatus = String(providerPayout?.status ?? '').toUpperCase();
         const status = this.incidentStatusFromProvider(providerStatus, IncidentStatus.EXECUTION_UNKNOWN);
@@ -442,11 +524,13 @@ export class RecoveryService implements OnApplicationBootstrap {
 
         const executionOutcome = status === IncidentStatus.RECOVERED ? ExecutionOutcome.SUCCEEDED : ExecutionOutcome.FAILED;
         await this.prisma.$transaction(async db => {
-          await db.payoutIncident.update({ where: { id: incident.id }, data: { status } });
+          const reason = (providerPayout as any)?.status_details?.description ?? (providerPayout as any)?.status_details?.reason ?? (providerPayout as any)?.failure_reason ?? incident.currentReason;
+          await db.payoutIncident.update({ where: { id: incident.id }, data: { status, currentReason: reason } });
           if (execution) await db.actionExecution.update({ where: { id: execution.id }, data: { outcome: executionOutcome, responseJson: providerJson } });
           else await db.actionExecution.updateMany({ where: { incidentId: incident.id, outcome: ExecutionOutcome.UNKNOWN }, data: { outcome: executionOutcome, responseJson: providerJson } });
           await this.audit(db, incident.id, 'RECONCILIATION_COMPLETED', 'SYSTEM', `Provider confirmed payout status ${providerStatus}`, { providerPayout, providerStatus }, undefined, status);
         });
+        if (status === IncidentStatus.FAILED || status === IncidentStatus.REVERSED) await this.analyze(incident.id);
         reconciled += 1;
       } catch (error) {
         const message = safeErrorMessage(error, 'Unknown reconciliation failure');
@@ -462,15 +546,20 @@ export class RecoveryService implements OnApplicationBootstrap {
     return { scanned: open.length, reconciled, pending, failures };
   }
   async createBatch(name: string, incidentIds: string[]) {
+    const normalizedIds = [...new Set(Array.isArray(incidentIds) ? incidentIds.filter(id => typeof id === 'string' && id.trim()).map(id => id.trim()) : [])];
+    if (!normalizedIds.length) throw new BadRequestException('A batch requires at least one incident from the current page');
+    const normalizedName = typeof name === 'string' && name.trim() ? name.trim().slice(0, 160) : `Batch ${new Date().toISOString()}`;
     const incidents = await this.prisma.payoutIncident.findMany({
-      where: { id: { in: incidentIds } },
+      where: { id: { in: normalizedIds } },
       include: {
         events: { orderBy: { receivedAt: 'asc' } },
         analyses: { orderBy: { createdAt: 'desc' }, take: 1 },
         policyDecisions: { orderBy: { createdAt: 'desc' }, take: 1 },
+        executions: true,
         auditEvents: { orderBy: { createdAt: 'asc' } },
       },
     });
+    if (incidents.length !== normalizedIds.length) throw new BadRequestException('One or more selected incidents no longer exist; refresh the queue before creating evidence');
     const snapshots = incidents.map(incident => {
       const analysis = incident.analyses[0];
       const proposal = aiProposalSchema.safeParse(analysis?.outputJson);
@@ -479,8 +568,6 @@ export class RecoveryService implements OnApplicationBootstrap {
         ? proposal.data.category === 'TRANSIENT_TECHNICAL' && proposal.data.recommendedAction === 'RETRY'
         : decision?.finalDecision === Decision.AUTO_RETRY;
       const humanInterventions = incident.auditEvents.filter(event => ['HUMAN_APPROVED', 'HUMAN_APPROVED_RETRY', 'HUMAN_REJECTED', 'BENEFICIARY_REMEDIATED'].includes(event.eventType)).length;
-      const protectedStates: IncidentStatus[] = [IncidentStatus.STOPPED, IncidentStatus.PROCESSING, IncidentStatus.EXECUTION_UNKNOWN];
-      const protectedState = protectedStates.includes(incident.status);
       const firstPayload = incident.events[0]?.payloadJson as { payload?: { payout?: { entity?: { status?: unknown } } } } | null;
       const originalProviderStatus = String(firstPayload?.payload?.payout?.entity?.status ?? '').toUpperCase();
       const snapshot = {
@@ -492,15 +579,16 @@ export class RecoveryService implements OnApplicationBootstrap {
         },
         analysis: analysis ? { modelRef: analysis.modelRef, promptVersion: analysis.promptVersion, outputJson: analysis.outputJson, confidence: analysis.confidence } : null,
         policyDecision: decision ? { policyVersion: decision.policyVersion, proposedAction: decision.proposedAction, finalDecision: decision.finalDecision, reasonsJson: decision.reasonsJson } : null,
+        actionOutcomes: incident.executions.map(execution => ({ actionType: execution.actionType, outcome: execution.outcome, responseJson: execution.responseJson })),
         originalProviderStatus,
       };
       return {
         incidentId: incident.id,
         finalState: incident.status,
-        recoveredValuePaise: incident.status === IncidentStatus.RECOVERED ? incident.amountPaise : 0,
+        recoveredValuePaise: this.attributedPayoutValue(incident),
         eligibleForRecovery,
         humanInterventions,
-        unsafeActionsPrevented: protectedState ? 1 : 0,
+        unsafeActionsPrevented: this.unsafeActionPrevented(analysis?.outputJson, decision?.finalDecision) ? 1 : 0,
         snapshot,
       };
     });
@@ -530,7 +618,7 @@ export class RecoveryService implements OnApplicationBootstrap {
     const cohortFingerprint = createHash('sha256').update(JSON.stringify(snapshots.map(item => item.snapshot).sort((a, b) => a.incident.id.localeCompare(b.incident.id)))).digest('hex');
     const batch = await this.prisma.$transaction(async db => {
       const created = await db.batchRun.create({ data: {
-        name,
+        name: normalizedName,
         cohortSize: incidents.length,
         totalValueAtRiskPaise,
         policyVersion: policyVersions.length === 1 ? policyVersions[0] : policyVersions.length ? 'mixed' : null,
@@ -556,11 +644,11 @@ export class RecoveryService implements OnApplicationBootstrap {
     return this.batchResults(batch.id);
   }
   async listBatches() {
-    const batches = await this.prisma.batchRun.findMany({ orderBy: { startedAt: 'desc' }, include: { results: { include: { incident: true } } } });
+    const batches = await this.prisma.batchRun.findMany({ orderBy: { startedAt: 'desc' }, include: { results: { include: { incident: { include: { auditEvents: true, executions: true } } } } } });
     return batches.map(batch => this.toBatchView(batch));
   }
   async batchResults(id: string) {
-    const batch = await this.prisma.batchRun.findUniqueOrThrow({ where: { id }, include: { results: { include: { incident: true } } } });
+    const batch = await this.prisma.batchRun.findUniqueOrThrow({ where: { id }, include: { results: { include: { incident: { include: { auditEvents: true, executions: true } } } } } });
     return this.toBatchView(batch);
   }
   async batchExportCsv(id: string) {
@@ -569,6 +657,10 @@ export class RecoveryService implements OnApplicationBootstrap {
     const rows = batch.results.map(result => [result.incidentId, result.incident.razorpayPayoutId, result.incident.amountPaise, result.incident.currency, result.finalState, result.recoveredValuePaise, result.incident.attempts, result.incident.currentReason ?? '', new Date(result.incident.updatedAt).toISOString()]);
     return [header, ...rows].map(row => row.map(value => this.csvValue(value)).join(',')).join('\n');
   }
+  async batchExportJson(id: string) {
+    const { liveMetrics: _liveMetrics, ...snapshot } = await this.batchResults(id);
+    return snapshot;
+  }
   async recordExecutionResult(executionId: string, outcome: ExecutionOutcome, response: unknown) {
     return this.prisma.$transaction(async db => {
       const execution = await db.actionExecution.findUniqueOrThrow({ where: { id: executionId } });
@@ -576,9 +668,18 @@ export class RecoveryService implements OnApplicationBootstrap {
       const claimed = await db.actionExecution.updateMany({ where: { id: executionId, outcome: ExecutionOutcome.PENDING }, data: { outcome, responseJson } });
       if (!claimed.count) return { recorded: false, incidentId: execution.incidentId };
       if (outcome === ExecutionOutcome.SUCCEEDED) {
-        await db.payoutIncident.update({ where: { id: execution.incidentId }, data: { status: IncidentStatus.RECOVERED, attempts: { increment: 1 } } });
+        const incident = await db.payoutIncident.findUniqueOrThrow({ where: { id: execution.incidentId } });
+        const duplicateRecoveryDetected = incident.status === IncidentStatus.RECOVERED;
+        await db.payoutIncident.update({ where: { id: execution.incidentId }, data: {
+          status: IncidentStatus.RECOVERED,
+          attempts: { increment: 1 },
+          ...(duplicateRecoveryDetected ? { duplicateSuspected: true } : {}),
+        } });
+        if (duplicateRecoveryDetected) await this.audit(db, execution.incidentId, 'DUPLICATE_PAYOUT_CONFIRMED', 'SYSTEM', 'The original payout recovered before the linked recovery action returned success; recovered-value attribution is blocked.', { executionId });
       } else {
-        await db.payoutIncident.update({ where: { id: execution.incidentId }, data: { attempts: { increment: 1 } } });
+        const provider = response && typeof response === 'object' ? response as Record<string, any> : {};
+        const providerReason = provider?.status_details?.description ?? provider?.status_details?.reason ?? provider?.failure_reason ?? (typeof provider?.error === 'string' ? provider.error : undefined);
+        await db.payoutIncident.update({ where: { id: execution.incidentId }, data: { attempts: { increment: 1 }, ...(typeof providerReason === 'string' && providerReason ? { currentReason: providerReason } : {}) } });
         await db.payoutIncident.updateMany({
           where: outcome === ExecutionOutcome.UNKNOWN
             ? { id: execution.incidentId, status: IncidentStatus.EXECUTING }
@@ -597,19 +698,68 @@ export class RecoveryService implements OnApplicationBootstrap {
     if (['FAILED', 'FAILURE', 'REJECTED', 'CANCELLED'].includes(providerStatus)) return IncidentStatus.FAILED;
     return fallback;
   }
-  private toBatchView(batch: BatchWithIncidents) {
-    const results = batch.results.map(result => {
-      const snapshot = result.snapshotJson as { incident?: Record<string, unknown> } | null;
+  private providerTransition(current: IncidentStatus | null, incoming: IncidentStatus, linkedRecovery: boolean) {
+    if (!current) return { status: incoming, applied: true, shouldAnalyze: incoming !== IncidentStatus.RECOVERED };
+    if (current === IncidentStatus.RECOVERED) return { status: current, applied: false, shouldAnalyze: false };
+    if (incoming === IncidentStatus.RECOVERED) return { status: incoming, applied: true, shouldAnalyze: false };
+    if (linkedRecovery) {
+      if (incoming === current) return { status: current, applied: true, shouldAnalyze: false };
       return {
-        ...result,
-        finalState: result.finalState,
-        eligibleForRecovery: Boolean(result.eligibleForRecovery),
-        recoveredValuePaise: result.recoveredValuePaise,
-        humanInterventions: result.humanInterventions ?? 0,
-        unsafeActionsPrevented: result.unsafeActionsPrevented ?? 0,
-        incident: snapshot?.incident ? { ...result.incident, ...snapshot.incident } : result.incident,
+        status: incoming,
+        applied: true,
+        shouldAnalyze: incoming === IncidentStatus.FAILED || incoming === IncidentStatus.REVERSED,
+      };
+    }
+    if (current === IncidentStatus.PROCESSING) {
+      if (incoming === IncidentStatus.FAILED || incoming === IncidentStatus.REVERSED) return { status: incoming, applied: true, shouldAnalyze: true };
+      return { status: current, applied: incoming === IncidentStatus.PROCESSING, shouldAnalyze: false };
+    }
+    if (current === IncidentStatus.RECEIVED) return { status: incoming, applied: true, shouldAnalyze: true };
+    // Once policy or an operator owns the workflow, repeated/late provider failure
+    // events are evidence only. They cannot move the state machine backwards.
+    return { status: current, applied: false, shouldAnalyze: false };
+  }
+  private unsafeActionPrevented(output: unknown, finalDecision?: Decision | null) {
+    const proposal = aiProposalSchema.safeParse(output);
+    return proposal.success
+      && proposal.data.recommendedAction === 'RETRY'
+      && Boolean(finalDecision)
+      && finalDecision !== Decision.AUTO_RETRY;
+  }
+  private attributedPayoutValue(incident: { status: IncidentStatus; amountPaise: number; duplicateSuspected?: boolean; executions?: Array<{ outcome: ExecutionOutcome; responseJson: Prisma.JsonValue | null }> }) {
+    if (incident.status !== IncidentStatus.RECOVERED || incident.duplicateSuspected) return 0;
+    const attributed = incident.executions?.some(execution => {
+      const response = execution.responseJson as { recovery_original_processed?: unknown } | null;
+      return execution.outcome === ExecutionOutcome.SUCCEEDED && response?.recovery_original_processed !== true;
+    });
+    return attributed ? incident.amountPaise : 0;
+  }
+  private toBatchView(batch: BatchWithIncidents) {
+    const resultViews = batch.results.map(result => {
+      const snapshot = result.snapshotJson as { incident?: Record<string, unknown> } | null;
+      const { auditEvents = [], executions = [], ...liveIncident } = result.incident;
+      const snapshotAnalysis = snapshot as { analysis?: { outputJson?: unknown }; policyDecision?: { finalDecision?: Decision } } | null;
+      return {
+        view: {
+          ...result,
+          finalState: result.finalState,
+          eligibleForRecovery: Boolean(result.eligibleForRecovery),
+          recoveredValuePaise: result.recoveredValuePaise,
+          humanInterventions: result.humanInterventions ?? 0,
+          unsafeActionsPrevented: result.unsafeActionsPrevented ?? 0,
+          incident: snapshot?.incident ? { ...liveIncident, ...snapshot.incident } : liveIncident,
+        },
+        liveMetric: {
+          finalState: result.incident.status,
+          recoveredValuePaise: this.attributedPayoutValue({ ...result.incident, executions }),
+          eligibleForRecovery: Boolean(result.eligibleForRecovery),
+          humanInterventions: auditEvents.filter(event => ['HUMAN_APPROVED', 'HUMAN_APPROVED_RETRY', 'HUMAN_REJECTED', 'BENEFICIARY_REMEDIATED'].includes(event.eventType)).length,
+          unsafeActionsPrevented: this.unsafeActionPrevented(snapshotAnalysis?.analysis?.outputJson, snapshotAnalysis?.policyDecision?.finalDecision) ? 1 : 0,
+          snapshot: { incident: { amountPaise: result.incident.amountPaise } },
+        },
       };
     });
+    const results = resultViews.map(result => result.view);
     const storedMetrics = batch.metricsJson as ReturnType<RecoveryService['calculateBatchMetrics']> | null;
     const metrics = storedMetrics ?? this.calculateBatchMetrics(results.map(result => ({
       finalState: result.finalState,
@@ -619,7 +769,8 @@ export class RecoveryService implements OnApplicationBootstrap {
       unsafeActionsPrevented: result.unsafeActionsPrevented,
       snapshot: { incident: { amountPaise: result.incident.amountPaise } },
     })), batch.totalValueAtRiskPaise);
-    return { ...batch, results, baseline: batch.baselineJson, metrics, immutable: Boolean(batch.completedAt && batch.metricsJson && batch.cohortFingerprint) };
+    const liveMetrics = this.calculateBatchMetrics(resultViews.map(result => result.liveMetric), batch.totalValueAtRiskPaise);
+    return { ...batch, results, baseline: batch.baselineJson, metrics, liveMetrics, immutable: Boolean(batch.completedAt && batch.metricsJson && batch.cohortFingerprint) };
   }
   private calculateBatchMetrics(results: Array<{ finalState: string; recoveredValuePaise: number; eligibleForRecovery: boolean; humanInterventions: number; unsafeActionsPrevented: number; snapshot: { incident: { amountPaise: number } } }>, valueAtRiskPaise: number) {
     const recoveredValuePaise = results.reduce((sum, result) => sum + result.recoveredValuePaise, 0);
@@ -630,20 +781,22 @@ export class RecoveryService implements OnApplicationBootstrap {
     const manualStates = ['APPROVAL_REQUIRED', 'ESCALATE'];
     const protectedStates = ['STOPPED', 'PROCESSING', 'EXECUTION_UNKNOWN'];
     const unresolvedStates = ['RECEIVED', 'ANALYZING', 'POLICY_PENDING', 'AUTO_RETRY', 'APPROVAL_REQUIRED', 'EXECUTING', 'PROCESSING', 'ESCALATE', 'EXECUTION_UNKNOWN'];
+    const unresolved = results.filter(result => unresolvedStates.includes(result.finalState));
     return {
       valueAtRiskPaise,
+      openValueAtRiskPaise: unresolved.reduce((sum, result) => sum + result.snapshot.incident.amountPaise, 0),
       recoveredValuePaise,
       recoveryRate: valueAtRiskPaise ? recoveredValuePaise / valueAtRiskPaise : 0,
       eligibleCount: eligible.length,
       eligibleValuePaise,
       recoveredEligibleValuePaise,
       eligibleRecoveryRate: eligibleValuePaise ? recoveredEligibleValuePaise / eligibleValuePaise : 0,
-      pendingRecoveryValuePaise: eligible.filter(result => result.finalState !== 'RECOVERED').reduce((sum, result) => sum + result.snapshot.incident.amountPaise, 0),
+      pendingRecoveryValuePaise: eligible.filter(result => unresolvedStates.includes(result.finalState)).reduce((sum, result) => sum + result.snapshot.incident.amountPaise, 0),
       manualReviewValuePaise: results.filter(result => manualStates.includes(result.finalState)).reduce((sum, result) => sum + result.snapshot.incident.amountPaise, 0),
       protectedValuePaise: results.filter(result => protectedStates.includes(result.finalState)).reduce((sum, result) => sum + result.snapshot.incident.amountPaise, 0),
       manualInterventions: results.reduce((sum, result) => sum + result.humanInterventions, 0),
       unsafeActionsPrevented: results.reduce((sum, result) => sum + result.unsafeActionsPrevented, 0),
-      unresolvedIncidents: results.filter(result => unresolvedStates.includes(result.finalState)).length,
+      unresolvedIncidents: unresolved.length,
       statusDistribution,
     };
   }

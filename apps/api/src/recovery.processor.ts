@@ -23,19 +23,24 @@ export class RecoveryProcessor extends WorkerHost {
     try {
       const response = execution.actionType === 'RAZORPAYX_TEST_PAYOUT'
         ? await this.razorpay.executeTestDemoPayout(execution.idempotencyKey, execution.incidentId)
-        : await this.razorpay.executeRecovery(execution.idempotencyKey, execution.incident.razorpayPayoutId, execution.incidentId);
+        : await this.razorpay.executeRecovery(execution.idempotencyKey, execution.incident.razorpayPayoutId, execution.incidentId, execution.incident.beneficiaryRef);
       const providerStatus = String(response?.status ?? '').toLowerCase();
       const outcome = providerStatus === 'processed'
         ? ExecutionOutcome.SUCCEEDED
         : ['failed', 'rejected', 'cancelled', 'reversed'].includes(providerStatus)
           ? ExecutionOutcome.FAILED
           : ExecutionOutcome.UNKNOWN;
-      await this.recovery.recordExecutionResult(execution.id, outcome, response);
+      const recorded = await this.recovery.recordExecutionResult(execution.id, outcome, response);
+      // A provider-confirmed terminal failure may enter a fresh AI + policy cycle.
+      // This is not a BullMQ replay: policy rechecks the incremented attempt count
+      // and, if allowed, creates a new delayed intent with a new idempotency key.
+      if (outcome === ExecutionOutcome.FAILED && recorded.recorded) await this.recovery.analyze(recorded.incidentId);
     } catch (error) {
       const message = safeErrorMessage(error, 'Unknown execution failure');
       const unknown = error instanceof RazorpayExecutionUncertainError || /timeout|network|unknown|reconciliation/i.test(message);
-      await this.recovery.recordExecutionResult(execution.id, unknown ? ExecutionOutcome.UNKNOWN : ExecutionOutcome.FAILED, { error: message });
+      const recorded = await this.recovery.recordExecutionResult(execution.id, unknown ? ExecutionOutcome.UNKNOWN : ExecutionOutcome.FAILED, { error: message });
       if (unknown) return;
+      if (recorded.recorded) await this.recovery.analyze(recorded.incidentId);
       throw error;
     }
   }

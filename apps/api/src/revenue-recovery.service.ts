@@ -1,4 +1,4 @@
-import { BadRequestException, ConflictException, ForbiddenException, Injectable, ServiceUnavailableException, type OnApplicationBootstrap } from '@nestjs/common';
+import { BadRequestException, ConflictException, ForbiddenException, Injectable, Logger, ServiceUnavailableException, type OnApplicationBootstrap } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { createHash, randomBytes } from 'crypto';
@@ -19,27 +19,34 @@ type DemoContext = { runId: string; actorId: string; retryDelaySeconds: number; 
 
 @Injectable()
 export class RevenueRecoveryService implements OnApplicationBootstrap {
+  private readonly logger = new Logger(RevenueRecoveryService.name);
   private demoActive = false;
   private lastRevenueAnalysisStartedAt: number | null = null;
   constructor(private readonly prisma: PrismaService, private readonly ai: AiService, @InjectQueue('revenue-recovery') private readonly queue: Queue) {}
 
   async onApplicationBootstrap() {
-    try { await this.recoverPendingActions(); } catch {}
+    try { await this.recoverPendingActions(); }
+    catch (error) { this.logger.warn(`Pending revenue-action recovery deferred: ${error instanceof Error ? error.message : 'unknown error'}`); }
   }
 
-  configuration() {
+  async configuration() {
     const enabled = process.env.ENABLE_REVENUE_DEMO === 'true';
     const simulationSafe = process.env.SIMULATION_MODE !== 'false';
+    const [database, redis] = await Promise.all([
+      this.withTimeout(this.prisma.$queryRaw`SELECT 1`, 5_000).then(() => true).catch(() => false),
+      this.withTimeout(this.queue.getJobCounts('waiting'), 5_000).then(() => true).catch(() => false),
+    ]);
     return {
       enabled, simulationSafe, aiConfigured: this.ai.status().configured,
-      ready: enabled && simulationSafe && this.ai.status().configured,
+      ready: enabled && simulationSafe && this.ai.status().configured && database && redis,
+      services: { database, redis },
       policy: REVENUE_POLICY,
       scenarios: REVENUE_DEMO_SCENARIOS.map(({ key, title, amountPaise, expectedCategory, expectedPolicyAction }) => ({ key, title, amountPaise, expectedCategory, expectedPolicyAction })),
     };
   }
 
   async runDemo(actorId = 'operator') {
-    const configuration = this.configuration();
+    const configuration = await this.configuration();
     if (!configuration.enabled) throw new ForbiddenException('Inbound revenue demonstration is disabled');
     if (!configuration.simulationSafe) throw new ForbiddenException('Inbound revenue demonstration requires simulation mode');
     if (!configuration.aiConfigured) throw new ServiceUnavailableException('A hosted AI provider is required for the inbound revenue demonstration');
@@ -76,9 +83,13 @@ export class RevenueRecoveryService implements OnApplicationBootstrap {
       return this.recordCapture(incident.id, externalEventId, eventType, entity, false);
     }
     if (eventType !== 'payment.failed') return { accepted: true, ignored: true, reason: 'Payment event is not a failed or captured terminal event' };
+    const amountPaise = Number(entity.amount ?? 0);
+    const currency = String(entity.currency ?? 'INR').toUpperCase();
+    if (!Number.isSafeInteger(amountPaise) || amountPaise <= 0) throw new BadRequestException('Payment amount must be a positive integer in paise');
+    if (!/^[A-Z]{3}$/.test(currency)) throw new BadRequestException('Payment currency must be a three-letter code');
     const createdAt = Number(entity.created_at) ? new Date(Number(entity.created_at) * 1_000) : new Date();
     return this.ingestFailure({
-      externalEventId, sourcePaymentId: String(entity.id), amountPaise: Number(entity.amount || 0), currency: String(entity.currency || 'INR'),
+      externalEventId, sourcePaymentId: String(entity.id), amountPaise, currency,
       customerRef: String(entity.customer_id || entity?.notes?.customer_ref || 'anonymous'), paymentMethod: String(entity.method || 'unknown'),
       failureCode: String(entity.error_code || entity.error_reason || 'UNKNOWN'), failureDescription: String(entity.error_description || entity.error_reason || 'Payment failed without provider detail'),
       consentToContact: entity?.notes?.consent_to_contact === true || entity?.notes?.consent_to_contact === 'true', occurredAt: createdAt,
@@ -113,16 +124,31 @@ export class RevenueRecoveryService implements OnApplicationBootstrap {
     const incident = await this.prisma.revenueIncident.findUniqueOrThrow({ where: { id }, include: { analyses: { orderBy: { createdAt: 'desc' }, take: 1 } } });
     if (incident.status !== RevenueIncidentStatus.APPROVAL_REQUIRED) throw new ConflictException('Only approval-required revenue incidents can be approved');
     const proposal = revenueProposalSchema.parse(incident.analyses[0]?.outputJson);
-    await this.prisma.revenueIncident.update({ where: { id }, data: { status: RevenueIncidentStatus.AUTO_ACTION } });
-    await this.audit(id, 'REVENUE_HUMAN_APPROVED', 'HUMAN', 'A human approved the bounded first playbook action.', { action: proposal.recommendedAction }, actorId);
-    await this.schedule(id, proposal.recommendedAction, 0, { actorId });
+    const delayMinutes = REVENUE_POLICY.minimumRetryDelayMinutes;
+    const scheduledFor = new Date(Date.now() + delayMinutes * 60_000);
+    const idempotencyKey = createHash('sha256').update(`revenue:${incident.id}:${incident.attemptCount + 1}:${proposal.recommendedAction}`).digest('hex').slice(0, 40);
+    const action = await this.prisma.$transaction(async db => {
+      const claimed = await db.revenueIncident.updateMany({ where: { id, status: RevenueIncidentStatus.APPROVAL_REQUIRED }, data: { status: RevenueIncidentStatus.AUTO_ACTION } });
+      if (!claimed.count) throw new ConflictException('This revenue review has already been decided');
+      const durableAction = await db.revenueAction.upsert({ where: { idempotencyKey }, update: {}, create: { incidentId: id, actionType: proposal.recommendedAction, idempotencyKey, scheduledFor } });
+      await db.revenueAuditEvent.create({ data: { incidentId: id, eventType: 'REVENUE_HUMAN_APPROVED', actorType: 'HUMAN', actorId, policyVersion: REVENUE_POLICY.version, rationale: 'A human approved the bounded first playbook action.', dataJson: { action: proposal.recommendedAction, actionId: durableAction.id, policyDelayMinutes: delayMinutes } } });
+      return durableAction;
+    });
+    await this.enqueue(action.id, action.scheduledFor);
     return this.detail(id);
   }
 
   async reject(id: string, actorId = 'operator') {
-    const changed = await this.prisma.revenueIncident.updateMany({ where: { id, status: RevenueIncidentStatus.APPROVAL_REQUIRED }, data: { status: RevenueIncidentStatus.STOPPED } });
-    if (!changed.count) throw new ConflictException('Only approval-required revenue incidents can be rejected');
-    await this.audit(id, 'REVENUE_HUMAN_REJECTED', 'HUMAN', 'A human rejected the proposed revenue action.', {}, actorId);
+    const incident = await this.prisma.revenueIncident.findUniqueOrThrow({ where: { id } });
+    if (!([RevenueIncidentStatus.APPROVAL_REQUIRED, RevenueIncidentStatus.ESCALATED] as RevenueIncidentStatus[]).includes(incident.status)) {
+      throw new ConflictException('Only approval-required or escalated revenue incidents can be stopped by an operator');
+    }
+    const escalated = incident.status === RevenueIncidentStatus.ESCALATED;
+    await this.prisma.$transaction(async db => {
+      const changed = await db.revenueIncident.updateMany({ where: { id, status: incident.status }, data: { status: RevenueIncidentStatus.STOPPED } });
+      if (!changed.count) throw new ConflictException('This revenue incident changed while the decision was being recorded');
+      await db.revenueAuditEvent.create({ data: { incidentId: id, eventType: escalated ? 'REVENUE_ESCALATION_CLOSED' : 'REVENUE_HUMAN_REJECTED', actorType: 'HUMAN', actorId, policyVersion: REVENUE_POLICY.version, rationale: escalated ? 'An operator acknowledged the escalation and closed it without executing a financial action.' : 'A human rejected the proposed revenue action.', dataJson: {} } });
+    });
     return this.detail(id);
   }
 
@@ -136,12 +162,14 @@ export class RevenueRecoveryService implements OnApplicationBootstrap {
     });
     const data = source?.dataJson as { simulatedOutcome?: unknown; scenarioKey?: unknown } | undefined;
     if (data?.simulatedOutcome !== 'CAPTURED') {
-      await this.prisma.$transaction(async db => {
-        await db.revenueAction.update({ where: { id: action.id }, data: { outcome: RevenueActionOutcome.BLOCKED, executedAt: new Date(), resultJson: { simulation: true, outcome: 'NO_CAPTURE' } } });
-        await db.revenueIncident.update({ where: { id: action.incidentId }, data: { status: RevenueIncidentStatus.STOPPED, attemptCount: { increment: 1 } } });
+      const recorded = await this.prisma.$transaction(async db => {
+        const claimed = await db.revenueAction.updateMany({ where: { id: action.id, outcome: RevenueActionOutcome.PENDING }, data: { outcome: RevenueActionOutcome.BLOCKED, executedAt: new Date(), resultJson: { simulation: true, outcome: 'NO_CAPTURE' } } });
+        if (!claimed.count) return false;
+        await db.revenueIncident.updateMany({ where: { id: action.incidentId, status: RevenueIncidentStatus.AUTO_ACTION }, data: { status: RevenueIncidentStatus.STOPPED, attemptCount: { increment: 1 } } });
         await db.revenueAuditEvent.create({ data: { incidentId: action.incidentId, eventType: 'REVENUE_ACTION_BLOCKED', actorType: 'SYSTEM', policyVersion: REVENUE_POLICY.version, rationale: 'The controlled outcome did not permit an attributed capture.', dataJson: { actionId: action.id, scenarioKey: data?.scenarioKey ?? null } } });
+        return true;
       });
-      return { executed: true, recovered: false };
+      return { executed: recorded, recovered: false };
     }
     const captureId = `sim_capture_${action.id}`;
     await this.recordCapture(action.incidentId, `evt_${captureId}`, 'payment.captured', { id: captureId, amount: action.incident.amountPaise, currency: action.incident.currency, notes: { recoveryos_incident_id: action.incidentId }, simulation: true }, true, action.id);
@@ -153,7 +181,14 @@ export class RevenueRecoveryService implements OnApplicationBootstrap {
     let requeued = 0;
     for (const action of actions) {
       if (action.incident.status !== RevenueIncidentStatus.AUTO_ACTION) continue;
+      const existingJob = await this.queue.getJob(action.id);
+      if (existingJob) {
+        const state = await existingJob.getState();
+        if (state !== 'completed' && state !== 'failed') continue;
+        await existingJob.remove();
+      }
       await this.enqueue(action.id, action.scheduledFor);
+      await this.prisma.revenueAuditEvent.create({ data: { incidentId: action.incidentId, eventType: 'REVENUE_ACTION_REQUEUED', actorType: 'SYSTEM', policyVersion: REVENUE_POLICY.version, rationale: 'A pending durable revenue action was restored after worker startup.', dataJson: { actionId: action.id } } });
       requeued += 1;
     }
     return { scanned: actions.length, requeued };
@@ -162,6 +197,40 @@ export class RevenueRecoveryService implements OnApplicationBootstrap {
   async listExperiments() {
     const rows = await this.prisma.revenueExperiment.findMany({ orderBy: { startedAt: 'desc' }, include: { results: true } });
     return rows.map(row => ({ ...row, baseline: row.baselineJson, metrics: row.metricsJson, immutable: true }));
+  }
+
+  async operationalMetrics() {
+    const incidents = await this.prisma.revenueIncident.findMany({
+      include: {
+        actions: true,
+        analyses: { orderBy: { createdAt: 'desc' }, take: 1 },
+        policyDecisions: { orderBy: { createdAt: 'desc' }, take: 1 },
+        auditEvents: { where: { eventType: { in: ['REVENUE_HUMAN_APPROVED', 'REVENUE_HUMAN_REJECTED'] } } },
+      },
+    });
+    const openStatuses: RevenueIncidentStatus[] = [RevenueIncidentStatus.DETECTED, RevenueIncidentStatus.ANALYZING, RevenueIncidentStatus.POLICY_PENDING, RevenueIncidentStatus.AUTO_ACTION, RevenueIncidentStatus.APPROVAL_REQUIRED, RevenueIncidentStatus.ESCALATED];
+    const reviewStatuses: RevenueIncidentStatus[] = [RevenueIncidentStatus.APPROVAL_REQUIRED, RevenueIncidentStatus.ESCALATED];
+    const results = incidents.map(incident => {
+      const attributedRevenuePaise = Math.min(incident.amountPaise, incident.actions.filter(action => action.outcome === RevenueActionOutcome.SUCCEEDED).reduce((sum, action) => sum + action.attributedRevenuePaise, 0));
+      const proposal = revenueProposalSchema.safeParse(incident.analyses[0]?.outputJson);
+      const decision = incident.policyDecisions[0];
+      const unsafePrevented = proposal.success && proposal.data.recommendedAction !== 'STOP' && decision && !decision.authorized;
+      return { incident, attributedRevenuePaise, unsafePrevented: Boolean(unsafePrevented) };
+    });
+    const valueAtRiskPaise = incidents.reduce((sum, incident) => sum + incident.amountPaise, 0);
+    const recoveredValuePaise = results.reduce((sum, result) => sum + result.attributedRevenuePaise, 0);
+    return {
+      valueAtRiskPaise,
+      openValueAtRiskPaise: results.filter(result => openStatuses.includes(result.incident.status)).reduce((sum, result) => sum + result.incident.amountPaise, 0),
+      recoveredValuePaise,
+      recoveryRate: valueAtRiskPaise ? recoveredValuePaise / valueAtRiskPaise : 0,
+      recoveredIncidentCount: results.filter(result => result.attributedRevenuePaise > 0).length,
+      manualReviewRequired: results.filter(result => reviewStatuses.includes(result.incident.status)).length,
+      interventions: results.reduce((sum, result) => sum + result.incident.auditEvents.length, 0),
+      unsafeActionsPrevented: results.filter(result => result.unsafePrevented).length,
+      evidenceCompleteness: incidents.length ? results.filter(result => result.incident.analyses.length && result.incident.policyDecisions.length).length / incidents.length : 1,
+      statusDistribution: incidents.reduce<Record<string, number>>((counts, incident) => { counts[incident.status] = (counts[incident.status] ?? 0) + 1; return counts; }, {}),
+    };
   }
 
   async experiment(id: string) {
@@ -189,10 +258,11 @@ export class RevenueRecoveryService implements OnApplicationBootstrap {
   }) {
     const existing = await this.prisma.revenueEvent.findUnique({ where: { externalEventId: input.externalEventId } });
     if (existing) return { duplicate: true, incidentId: existing.incidentId };
-    const incident = await this.prisma.$transaction(async db => {
+    const ingestion = await this.prisma.$transaction(async db => {
+      const existingIncident = await db.revenueIncident.findUnique({ where: { sourcePaymentId: input.sourcePaymentId } });
       const record = await db.revenueIncident.upsert({
         where: { sourcePaymentId: input.sourcePaymentId },
-        update: { status: RevenueIncidentStatus.DETECTED, failureCode: input.failureCode, failureDescription: input.failureDescription },
+        update: { failureCode: input.failureCode, failureDescription: input.failureDescription },
         create: { sourcePaymentId: input.sourcePaymentId, status: RevenueIncidentStatus.DETECTED, amountPaise: input.amountPaise, currency: input.currency, customerRef: input.customerRef, paymentMethod: input.paymentMethod, failureCode: input.failureCode, failureDescription: input.failureDescription, consentToContact: input.consentToContact, expiresAt: new Date(input.occurredAt.getTime() + 7 * 24 * 60 * 60 * 1_000) },
       });
       if (input.demoContext) {
@@ -202,15 +272,17 @@ export class RevenueRecoveryService implements OnApplicationBootstrap {
         }
       }
       await db.revenueEvent.create({ data: { externalEventId: input.externalEventId, incidentId: record.id, eventType: input.eventType, occurredAt: input.occurredAt, dataJson: this.jsonValue({ summary: input.eventSummary, ...this.safeRaw(input.raw) }) } });
-      await db.revenueAuditEvent.create({ data: { incidentId: record.id, eventType: input.demoContext ? 'REVENUE_DEMO_FAILURE_SEEDED' : 'REVENUE_FAILURE_DETECTED', actorType: 'SYSTEM', rationale: input.demoContext ? 'A controlled failed inbound payment was added to the reproducible cohort.' : 'A signed provider webhook reported failed inbound revenue.', dataJson: { externalEventId: input.externalEventId, eventType: input.eventType } } });
-      return record;
+      const shouldAnalyze = !existingIncident;
+      await db.revenueAuditEvent.create({ data: { incidentId: record.id, eventType: input.demoContext ? 'REVENUE_DEMO_FAILURE_SEEDED' : shouldAnalyze ? 'REVENUE_FAILURE_DETECTED' : 'REVENUE_FAILURE_RECORDED_NO_STATE_CHANGE', actorType: 'SYSTEM', rationale: input.demoContext ? 'A controlled failed inbound payment was added to the reproducible cohort.' : shouldAnalyze ? 'A signed provider webhook reported failed inbound revenue.' : 'A later failure event was preserved without moving the existing revenue workflow backward.', dataJson: { externalEventId: input.externalEventId, eventType: input.eventType, preservedStatus: existingIncident?.status ?? null } } });
+      return { record, shouldAnalyze };
     });
-    await this.analyze(incident.id, input.demoContext);
-    return { duplicate: false, incidentId: incident.id };
+    if (ingestion.shouldAnalyze) await this.analyze(ingestion.record.id, input.demoContext);
+    return { duplicate: false, incidentId: ingestion.record.id };
   }
 
   private async analyze(incidentId: string, demoContext?: DemoContext) {
-    await this.prisma.revenueIncident.update({ where: { id: incidentId }, data: { status: RevenueIncidentStatus.ANALYZING } });
+    const claimed = await this.prisma.revenueIncident.updateMany({ where: { id: incidentId, status: RevenueIncidentStatus.DETECTED }, data: { status: RevenueIncidentStatus.ANALYZING } });
+    if (!claimed.count) return { skipped: true };
     const incident = await this.prisma.revenueIncident.findUniqueOrThrow({ where: { id: incidentId }, include: { events: { orderBy: { occurredAt: 'asc' } } } });
     const context = revenueIncidentContextSchema.parse({
       incidentId: incident.id, sourcePaymentId: incident.sourcePaymentId, amountPaise: incident.amountPaise, currency: incident.currency,
@@ -226,13 +298,15 @@ export class RevenueRecoveryService implements OnApplicationBootstrap {
       : policy.finalAction === 'APPROVAL_REQUIRED' ? RevenueIncidentStatus.APPROVAL_REQUIRED
         : policy.finalAction === 'ESCALATE' ? RevenueIncidentStatus.ESCALATED : RevenueIncidentStatus.STOPPED;
     const timelineDigest = createHash('sha256').update(JSON.stringify(context.timeline)).digest('hex');
-    await this.prisma.$transaction(async db => {
+    const applied = await this.prisma.$transaction(async db => {
+      const current = await db.revenueIncident.updateMany({ where: { id: incidentId, status: RevenueIncidentStatus.ANALYZING }, data: { status } });
+      if (!current.count) return false;
       await db.revenueAnalysis.create({ data: { incidentId, modelRef: analysis.modelRef, promptVersion: analysis.promptVersion, timelineDigest, outputJson: proposal, confidence: proposal.confidence } });
       await db.revenuePolicyDecision.create({ data: { incidentId, policyVersion: REVENUE_POLICY.version, proposedAction: proposal.recommendedAction, finalAction: policy.finalAction, authorized: policy.authorized, reasonsJson: policy.reasons } });
-      await db.revenueIncident.update({ where: { id: incidentId }, data: { status } });
       await db.revenueAuditEvent.create({ data: { incidentId, eventType: 'REVENUE_POLICY_DECISION', actorType: 'POLICY', policyVersion: REVENUE_POLICY.version, rationale: policy.reasons.join('; '), dataJson: this.jsonValue({ proposal, policy, modelRef: analysis.modelRef, promptVersion: analysis.promptVersion, timelineDigest }) } });
+      return true;
     });
-    if (policy.finalAction === 'AUTO_RETRY') await this.schedule(incidentId, proposal.recommendedAction, policy.delayMinutes ?? REVENUE_POLICY.minimumRetryDelayMinutes, demoContext ? { actorId: demoContext.actorId, retryDelaySeconds: demoContext.retryDelaySeconds } : undefined);
+    if (applied && policy.finalAction === 'AUTO_RETRY') await this.schedule(incidentId, proposal.recommendedAction, policy.delayMinutes ?? REVENUE_POLICY.minimumRetryDelayMinutes, demoContext ? { actorId: demoContext.actorId, retryDelaySeconds: demoContext.retryDelaySeconds } : undefined);
     return policy;
   }
 
@@ -249,9 +323,12 @@ export class RevenueRecoveryService implements OnApplicationBootstrap {
     const incident = await this.prisma.revenueIncident.findUniqueOrThrow({ where: { id: incidentId } });
     const idempotencyKey = createHash('sha256').update(`revenue:${incident.id}:${incident.attemptCount + 1}:${actionType}`).digest('hex').slice(0, 40);
     const scheduledFor = new Date(Date.now() + (demo?.retryDelaySeconds !== undefined ? demo.retryDelaySeconds * 1_000 : delayMinutes * 60_000));
-    const action = await this.prisma.revenueAction.upsert({ where: { idempotencyKey }, update: {}, create: { incidentId, actionType, idempotencyKey, scheduledFor } });
+    const action = await this.prisma.$transaction(async db => {
+      const durableAction = await db.revenueAction.upsert({ where: { idempotencyKey }, update: {}, create: { incidentId, actionType, idempotencyKey, scheduledFor } });
+      await db.revenueAuditEvent.create({ data: { incidentId, eventType: 'REVENUE_ACTION_REQUESTED', actorType: 'SYSTEM', actorId: demo?.actorId, policyVersion: REVENUE_POLICY.version, rationale: 'The policy-authorized first playbook action was durably scheduled.', dataJson: { actionId: durableAction.id, actionType, policyDelayMinutes: delayMinutes, effectiveDemoDelaySeconds: demo?.retryDelaySeconds ?? null } } });
+      return durableAction;
+    });
     await this.enqueue(action.id, scheduledFor);
-    await this.audit(incidentId, 'REVENUE_ACTION_REQUESTED', 'SYSTEM', 'The policy-authorized first playbook action was durably scheduled.', { actionId: action.id, actionType, policyDelayMinutes: delayMinutes, effectiveDemoDelaySeconds: demo?.retryDelaySeconds ?? null }, demo?.actorId);
     return action;
   }
 
@@ -262,15 +339,35 @@ export class RevenueRecoveryService implements OnApplicationBootstrap {
   private async recordCapture(incidentId: string, externalEventId: string, eventType: string, entity: any, simulation: boolean, actionId?: string) {
     const existing = await this.prisma.revenueEvent.findUnique({ where: { externalEventId } });
     if (existing) return { duplicate: true, incidentId };
-    await this.prisma.$transaction(async db => {
+    const result = await this.prisma.$transaction(async db => {
       const incident = await db.revenueIncident.findUniqueOrThrow({ where: { id: incidentId } });
-      await db.revenueEvent.create({ data: { externalEventId, incidentId, eventType, occurredAt: new Date(), dataJson: this.jsonValue({ summary: simulation ? 'Controlled recovery payment captured after the policy-authorized action.' : 'Provider confirmed that the recovery payment was captured.', paymentStatus: 'captured', simulation }) } });
-      await db.revenueIncident.update({ where: { id: incidentId }, data: { status: RevenueIncidentStatus.RECOVERED, recoveredAt: new Date(), attemptCount: { increment: 1 } } });
+      const captureAmountPaise = Number(entity?.amount);
+      const captureCurrency = String(entity?.currency ?? '').toUpperCase();
+      const financialMatch = Number.isSafeInteger(captureAmountPaise)
+        && captureAmountPaise > 0
+        && captureAmountPaise === incident.amountPaise
+        && captureCurrency === incident.currency;
       const action = actionId ? await db.revenueAction.findUnique({ where: { id: actionId } }) : await db.revenueAction.findFirst({ where: { incidentId, outcome: RevenueActionOutcome.PENDING }, orderBy: { createdAt: 'desc' } });
-      if (action) await db.revenueAction.update({ where: { id: action.id }, data: { outcome: RevenueActionOutcome.SUCCEEDED, executedAt: new Date(), attributedRevenuePaise: incident.amountPaise, resultJson: this.jsonValue({ providerPaymentStatus: 'captured', providerPaymentIdHash: createHash('sha256').update(String(entity?.id || externalEventId)).digest('hex'), simulation }) } });
-      await db.revenueAuditEvent.create({ data: { incidentId, eventType: 'REVENUE_ATTRIBUTED', actorType: 'SYSTEM', policyVersion: REVENUE_POLICY.version, rationale: 'Captured revenue was attributed to the bounded recovery action through the persisted incident reference.', dataJson: { externalEventId, actionId: action?.id ?? null, amountPaise: incident.amountPaise, simulation } } });
+      const validAction = financialMatch && action?.incidentId === incidentId && action.outcome === RevenueActionOutcome.PENDING ? action : null;
+      const actionClaim = validAction ? await db.revenueAction.updateMany({ where: { id: validAction.id, incidentId, outcome: RevenueActionOutcome.PENDING }, data: { outcome: RevenueActionOutcome.SUCCEEDED, executedAt: new Date(), attributedRevenuePaise: incident.amountPaise, resultJson: this.jsonValue({ providerPaymentStatus: 'captured', providerPaymentIdHash: createHash('sha256').update(String(entity?.id || externalEventId)).digest('hex'), simulation }) } }) : { count: 0 };
+      const wasAttributed = actionClaim.count === 1;
+      const summary = !financialMatch
+        ? 'Provider capture was recorded, but its amount or currency did not match the incident.'
+        : wasAttributed
+          ? 'Captured revenue matched a pending policy-authorized recovery action.'
+          : 'Provider capture was recorded, but no pending recovery action could be attributed.';
+      await db.revenueEvent.create({ data: { externalEventId, incidentId, eventType, occurredAt: new Date(), dataJson: this.jsonValue({ summary, paymentStatus: 'captured', simulation, attributed: wasAttributed, financialMatch, captureAmountPaise: Number.isSafeInteger(captureAmountPaise) ? captureAmountPaise : null, captureCurrency: captureCurrency || null }) } });
+      if (financialMatch) await db.revenueIncident.update({ where: { id: incidentId }, data: { status: RevenueIncidentStatus.RECOVERED, recoveredAt: incident.recoveredAt ?? new Date(), ...(wasAttributed ? { attemptCount: { increment: 1 } } : {}) } });
+      const auditType = !financialMatch ? 'REVENUE_CAPTURE_MISMATCH' : wasAttributed ? 'REVENUE_ATTRIBUTED' : 'REVENUE_CAPTURE_UNATTRIBUTED';
+      const rationale = !financialMatch
+        ? 'The capture was preserved as evidence but did not close the incident or enter recovered totals because its financial identity did not match.'
+        : wasAttributed
+          ? 'Captured revenue was attributed to the bounded recovery action through the persisted incident reference.'
+          : 'The payment recovered, but RecoveryOS did not claim credit because no pending recovery action matched it.';
+      await db.revenueAuditEvent.create({ data: { incidentId, eventType: auditType, actorType: 'SYSTEM', policyVersion: REVENUE_POLICY.version, rationale, dataJson: { externalEventId, actionId: wasAttributed ? validAction?.id : null, amountPaise: wasAttributed ? incident.amountPaise : 0, expectedAmountPaise: incident.amountPaise, expectedCurrency: incident.currency, captureAmountPaise: Number.isSafeInteger(captureAmountPaise) ? captureAmountPaise : null, captureCurrency: captureCurrency || null, simulation } } });
+      return { attributed: wasAttributed, recovered: financialMatch };
     });
-    return { duplicate: false, incidentId, recovered: true };
+    return { duplicate: false, incidentId, ...result };
   }
 
   private async waitForActions(incidentIds: string[], timeoutMs: number) {
@@ -302,7 +399,8 @@ export class RevenueRecoveryService implements OnApplicationBootstrap {
         actionOutcomes: incident.actions.map(action => ({ actionType: action.actionType, outcome: action.outcome, attributedRevenuePaise: action.attributedRevenuePaise })),
       };
       return {
-        incidentId: incident.id, finalState: incident.status, recoveredValuePaise: incident.status === RevenueIncidentStatus.RECOVERED ? incident.amountPaise : 0,
+        incidentId: incident.id, finalState: incident.status,
+        recoveredValuePaise: Math.min(incident.amountPaise, incident.actions.filter(action => action.outcome === RevenueActionOutcome.SUCCEEDED).reduce((sum, action) => sum + action.attributedRevenuePaise, 0)),
         interventionCount: incident.auditEvents.filter(event => ['REVENUE_HUMAN_APPROVED', 'REVENUE_HUMAN_REJECTED'].includes(event.eventType)).length,
         unsafeActionsPrevented: !decision?.authorized && ([RevenueIncidentStatus.STOPPED, RevenueIncidentStatus.ESCALATED] as RevenueIncidentStatus[]).includes(incident.status) ? 1 : 0,
         snapshot,
@@ -313,7 +411,7 @@ export class RevenueRecoveryService implements OnApplicationBootstrap {
     const rulesOnlyRecoveredValuePaise = results.filter(result => result.snapshot.rulesBaselineEligible).reduce((sum, result) => sum + result.recoveredValuePaise, 0);
     const metrics = {
       valueAtRiskPaise: totalValueAtRiskPaise, recoveredValuePaise, recoveryRate: totalValueAtRiskPaise ? recoveredValuePaise / totalValueAtRiskPaise : 0,
-      recoveredIncidentCount: results.filter(result => result.finalState === RevenueIncidentStatus.RECOVERED).length,
+      recoveredIncidentCount: results.filter(result => result.recoveredValuePaise > 0).length,
       manualReviewRequired: results.filter(result => ([RevenueIncidentStatus.APPROVAL_REQUIRED, RevenueIncidentStatus.ESCALATED] as RevenueIncidentStatus[]).includes(result.finalState)).length,
       interventions: results.reduce((sum, result) => sum + result.interventionCount, 0),
       unsafeActionsPrevented: results.reduce((sum, result) => sum + result.unsafeActionsPrevented, 0),
@@ -358,6 +456,16 @@ export class RevenueRecoveryService implements OnApplicationBootstrap {
       expectedCategory: typeof value.expectedCategory === 'string' ? value.expectedCategory : undefined,
       expectedPolicyAction: typeof value.expectedPolicyAction === 'string' ? value.expectedPolicyAction : undefined,
     };
+  }
+
+  private withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('operation timed out')), timeoutMs);
+      promise.then(
+        value => { clearTimeout(timer); resolve(value); },
+        error => { clearTimeout(timer); reject(error); },
+      );
+    });
   }
 
   private jsonValue(value: unknown): Prisma.InputJsonValue { return JSON.parse(JSON.stringify(value ?? null)) as Prisma.InputJsonValue; }

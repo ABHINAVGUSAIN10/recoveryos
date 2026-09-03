@@ -38,7 +38,7 @@ This is a separate, administrator-only path on the same presenter page. It delib
 
 Be precise during the presentation: the initial temporary failure is a controlled demonstration seed; the recovery payout, its RazorpayX lifecycle, webhook, and dashboard/account-statement evidence are genuine Test Mode provider interactions. No real money moves. The endpoint refuses live credentials and applies an administrator gate, fixed amount, exact destination, cooldown, policy cap, duplicate controls, and durable idempotency.
 
-For an ambiguous or timed-out execution, call `POST /api/v1/reconcile`. RecoveryOS queries the provider and records a terminal outcome when one is confirmed; it never creates another payout while the provider remains uncertain.
+For an ambiguous or timed-out execution, use **Reconcile now** on the incident or **Reconcile payouts** under Operations (administrator access), or call `POST /api/v1/reconcile`. RecoveryOS queries the provider and records a terminal outcome when one is confirmed; it never creates another payout while the provider remains uncertain.
 
 New batch metrics are immutable snapshots. Outcomes, intervention counts, safety decisions, policy/model/prompt versions, and cohort fingerprints are frozen when the batch completes. A retry that succeeds later belongs in a new outcome snapshot; it cannot rewrite prior evidence.
 

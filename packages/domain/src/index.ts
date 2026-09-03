@@ -37,7 +37,7 @@ export const policyConfigSchema = z.object({
 export type PolicyConfig = z.infer<typeof policyConfigSchema>;
 
 export const beneficiaryRemediationSchema = z.object({
-  beneficiaryRef: z.string().trim().min(3).max(200),
+  beneficiaryRef: z.string().trim().max(200).regex(/^fa_[A-Za-z0-9]+$/, 'must be a Razorpay fund account ID beginning with fa_'),
   note: z.string().trim().min(10).max(500),
 });
 export type BeneficiaryRemediation = z.infer<typeof beneficiaryRemediationSchema>;

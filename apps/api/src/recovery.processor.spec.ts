@@ -8,21 +8,32 @@ describe('RecoveryProcessor fault handling', () => {
   it('records provider timeouts as execution unknown and does not retry inside the worker', async () => {
     const prisma = { actionExecution: { findUniqueOrThrow: jest.fn().mockResolvedValue(execution) }, payoutIncident: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) } };
     const razorpay = { executeRecovery: jest.fn().mockRejectedValue(new Error('network timeout token=private')) };
-    const recovery = { recordExecutionResult: jest.fn() };
+    const recovery = { recordExecutionResult: jest.fn().mockResolvedValue({ recorded: true, incidentId: execution.incidentId }), analyze: jest.fn() };
     const processor = new RecoveryProcessor(prisma as never, razorpay as never, recovery as never);
 
     await expect(processor.process(job as never)).resolves.toBeUndefined();
     expect(recovery.recordExecutionResult).toHaveBeenCalledWith(execution.id, ExecutionOutcome.UNKNOWN, { error: 'network timeout token=[REDACTED]' });
   });
 
-  it('records definite provider failures and allows BullMQ retry policy to handle them', async () => {
+  it('records definite request failures without blindly replaying the financial call', async () => {
     const prisma = { actionExecution: { findUniqueOrThrow: jest.fn().mockResolvedValue(execution) }, payoutIncident: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) } };
     const razorpay = { executeRecovery: jest.fn().mockRejectedValue(new Error('definite provider rejection')) };
-    const recovery = { recordExecutionResult: jest.fn() };
+    const recovery = { recordExecutionResult: jest.fn().mockResolvedValue({ recorded: true, incidentId: execution.incidentId }), analyze: jest.fn() };
     const processor = new RecoveryProcessor(prisma as never, razorpay as never, recovery as never);
 
     await expect(processor.process(job as never)).rejects.toThrow('definite provider rejection');
     expect(recovery.recordExecutionResult).toHaveBeenCalledWith(execution.id, ExecutionOutcome.FAILED, { error: 'definite provider rejection' });
+    expect(recovery.analyze).toHaveBeenCalledWith(execution.incidentId);
+  });
+
+  it('re-evaluates a provider-confirmed terminal failure under the incremented retry limit', async () => {
+    const prisma = { actionExecution: { findUniqueOrThrow: jest.fn().mockResolvedValue(execution) }, payoutIncident: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) } };
+    const response = { id: 'pout_retry', status: 'failed', status_details: { description: 'Temporary bank outage' } };
+    const recovery = { recordExecutionResult: jest.fn().mockResolvedValue({ recorded: true, incidentId: execution.incidentId }), analyze: jest.fn() };
+    const processor = new RecoveryProcessor(prisma as never, { executeRecovery: jest.fn().mockResolvedValue(response) } as never, recovery as never);
+
+    await expect(processor.process(job as never)).resolves.toBeUndefined();
+    expect(recovery.analyze).toHaveBeenCalledWith(execution.incidentId);
   });
 
   it('converts an execution interrupted by a worker restart to unknown without calling Razorpay again', async () => {
@@ -54,7 +65,7 @@ describe('RecoveryProcessor fault handling', () => {
     const processor = new RecoveryProcessor(prisma as never, razorpay as never, recovery as never);
 
     await expect(processor.process(job as never)).resolves.toBeUndefined();
-    expect(razorpay.executeRecovery).toHaveBeenCalledWith(execution.idempotencyKey, execution.incident.razorpayPayoutId, execution.incidentId);
+    expect(razorpay.executeRecovery).toHaveBeenCalledWith(execution.idempotencyKey, execution.incident.razorpayPayoutId, execution.incidentId, undefined);
     expect(recovery.recordExecutionResult).toHaveBeenCalledWith(execution.id, ExecutionOutcome.UNKNOWN, response);
   });
 

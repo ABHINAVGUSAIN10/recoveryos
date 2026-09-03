@@ -62,7 +62,7 @@ The regression suite proves the following fail-closed behavior:
 - A worker restart requeues a durable unclaimed action intent. An action found in progress becomes `EXECUTION_UNKNOWN` and is reconciled without another provider submission.
 - Concurrent workers atomically claim an incident, and execution-result recording is idempotent.
 - Concurrent duplicate webhook deliveries converge on the unique event ledger and return the original incident without a second analysis.
-- Definite provider failure is recorded as failed and left to the bounded BullMQ retry policy.
+- A provider-confirmed terminal retry failure is recorded, increments the attempt count, and enters a fresh AI + deterministic-policy evaluation before any new delayed action intent can exist. A request-level failure is recorded once and the worker job fails visibly; BullMQ never blindly repeats the financial call.
 - Reconciliation keeps provider `processing` cases blocked until a terminal status is confirmed.
 - Database or Redis readiness failure produces `degraded` operational state without leaking a credential.
 - Provider error bodies and recognized secrets are excluded or redacted from errors and logs.
@@ -73,7 +73,7 @@ Use `--case=<case-name>` only for a focused diagnostic probe; acceptance still r
 
 The production classifier uses Groq GPT-OSS 120B with low reasoning effort and strict JSON Schema. `AI_THINKING_MODE=disabled` remains explicit for provider portability. This bounded classification task benefits from lower latency, lower reasoning-token use, and schema-constrained output. Any future reasoning-mode experiment must use a separate evaluation cohort and must not change the deterministic authorization boundary.
 
-Run the six-case smoke evaluation with `pnpm ai:evaluate -- --require-live`. Run the fixed 50-case safety cohort with `pnpm ai:evaluate -- --require-live --cohort=full --summary-only`; compact output retains aggregate counts and any failed cases. Live Groq evaluations default to a four-second minimum interval between request starts and honor bounded `Retry-After` delays on HTTP 429 responses. Override the pacing only for a verified account limit with `--request-interval-ms=<milliseconds>`.
+Run the six-case smoke evaluation with `pnpm ai:evaluate -- --require-live`. Run the fixed 50-case safety cohort with `pnpm ai:evaluate -- --require-live --cohort=full --summary-only`; compact output retains aggregate counts and any failed cases. Live Groq evaluations default to a nine-second minimum interval between request starts and honor bounded `Retry-After` delays on HTTP 429 responses. Override the pacing only for a verified account limit with `--request-interval-ms=<milliseconds>`.
 
 ## Operator response
 

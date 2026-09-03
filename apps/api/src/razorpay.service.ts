@@ -89,7 +89,7 @@ export class RazorpayService {
   }
 
   async fetchPayout(payoutId: string): Promise<RazorpayPayout> {
-    if (this.simulation) return { id: payoutId, status: 'processed', status_details: { description: 'Simulated payout' } };
+    if (this.simulation) return { id: payoutId, status: 'processing', status_details: { description: 'Simulation preserves ambiguous provider state until an explicit terminal fixture arrives.' } };
     return this.request(`/v1/payouts/${encodeURIComponent(payoutId)}`, 'GET');
   }
 
@@ -110,7 +110,7 @@ export class RazorpayService {
     return this.request('/v1/payouts', 'POST', payload, idempotencyKey);
   }
 
-  async executeRecovery(idempotencyKey: string, payoutId: string, incidentId?: string) {
+  async executeRecovery(idempotencyKey: string, payoutId: string, incidentId?: string, remediatedFundAccountId?: string | null) {
     if (this.simulation) return { id: payoutId, status: 'processed', simulated: true };
     if (!incidentId) throw new RazorpayRecoveryBlockedError('Recovery incident context is required.');
     const original = await this.fetchPayout(payoutId);
@@ -124,7 +124,7 @@ export class RazorpayService {
     }
 
     const accountNumber = original.account_number ?? original.debit_account_number;
-    const fundAccountId = original.fund_account_id;
+    const fundAccountId = remediatedFundAccountId?.startsWith('fa_') ? remediatedFundAccountId : original.fund_account_id;
     const amount = original.amount;
     const currency = original.currency;
     const mode = original.mode;

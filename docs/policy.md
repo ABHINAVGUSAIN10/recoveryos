@@ -13,7 +13,7 @@ The policy is versioned in PostgreSQL. Its default is intentionally conservative
 
 Razorpay recovery uses a deterministic 35-character idempotency key and repeats the identical body after an ambiguous response. A new payout is created only after the original is confirmed `failed`. Recovery references link signed provider webhooks to the original incident timeline, and low-balance queueing is explicitly disabled.
 
-An `ESCALATE` review is not an approval. A validated replacement beneficiary and remediation note must be recorded first. The system then opens a new `RETRY_APPROVAL` task, and maker-checker control requires a different actor to approve it.
+An `ESCALATE` review is not an approval. A validated replacement Razorpay fund-account ID (`fa_...`) and remediation note must be recorded first. The approved retry uses that replacement fund account. The system then opens a new `RETRY_APPROVAL` task, and maker-checker control requires a different actor to approve it.
 
 ## Inbound revenue policy v1.0.0
 

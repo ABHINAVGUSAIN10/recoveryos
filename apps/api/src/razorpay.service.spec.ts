@@ -31,6 +31,11 @@ describe('RazorpayService guarded payout adapter', () => {
     await expect(new RazorpayService().fetchPayout('pout_1')).rejects.not.toThrow('sensitive');
   });
 
+  it('does not invent a terminal provider confirmation during simulation reconciliation', async () => {
+    process.env.SIMULATION_MODE = 'true';
+    await expect(new RazorpayService().fetchPayout('pout_processing')).resolves.toMatchObject({ status: 'processing' });
+  });
+
   it('maps the typed request to Razorpay snake-case fields and mandatory idempotency header', async () => {
     global.fetch = jest.fn().mockResolvedValue({ ok: true, status: 200, json: jest.fn().mockResolvedValue({ id: 'pout_new', status: 'processing' }) }) as never;
     const service = new RazorpayService();
@@ -67,14 +72,14 @@ describe('RazorpayService guarded payout adapter', () => {
       .mockResolvedValueOnce({ ok: true, status: 200, json: jest.fn().mockResolvedValue({ id: 'pout_retry', status: 'processing' }) }) as never;
     const key = recoveryIdempotencyKey(incidentId, 1);
 
-    await expect(new RazorpayService().executeRecovery(key, 'pout_1', incidentId))
+    await expect(new RazorpayService().executeRecovery(key, 'pout_1', incidentId, 'fa_remediated'))
       .resolves.toEqual({ id: 'pout_retry', status: 'processing' });
 
     expect(global.fetch).toHaveBeenCalledTimes(2);
     const [, createRequest] = (global.fetch as jest.Mock).mock.calls[1];
     const body = JSON.parse(createRequest.body);
     expect(body).toMatchObject({
-      account_number: '1234567890', fund_account_id: 'fa_1', amount: 2500, queue_if_low_balance: false,
+      account_number: '1234567890', fund_account_id: 'fa_remediated', amount: 2500, queue_if_low_balance: false,
       reference_id: recoveryReferenceId(incidentId),
       notes: { recovery_incident_id: incidentId, recovery_original_payout_id: 'pout_1' },
     });
